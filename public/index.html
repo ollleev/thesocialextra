@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="fr">
+<html lang="fr" data-appearance="notice">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#fafbf7">
+  <meta name="theme-color" content="#f7f4ef">
   <meta name="description" content="thesocialextra : personnes disponibles et missions autour de vous. Gratuit, local, maintenant. Prototype local.">
   <title>thesocialextra — Ça se passe maintenant.</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
@@ -11,20 +11,25 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="apple-touch-icon" href="/assets/pwa-icon-180.png">
   <script src="/install.js" type="module"></script>
+  <script src="/appearance.js" type="module"></script>
   <script src="/app.js" type="module"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Aller aux annonces</a>
   <header class="header">
-    <a class="brand" href="/" aria-label="thesocialextra, accueil">thesocialextra<span>.</span><span class="brand-wave" aria-hidden="true"></span></a>
+    <a class="brand" href="/" aria-label="thesocialextra, accueil"><span class="brand-the">the</span><span class="brand-social">social</span><span class="brand-extra">extra</span><span class="brand-dot">.</span></a>
     <nav class="navigation" aria-label="Navigation principale">
       <button id="live-nav" class="nav-link active" aria-current="page">En direct</button>
       <button id="mine-nav" disabled class="nav-link">Mes annonces<span id="mine-count" hidden>0</span></button>
+      <button id="events-nav" class="nav-link" hidden>Événements</button>
       <button id="account-button" class="nav-link" hidden>Connexion</button>
     </nav>
-    <div class="header-end"><span class="free-label">Gratuit. Tout simplement.</span><button id="inbox-button" disabled class="icon-button" aria-label="Mes échanges" title="Mes échanges"><span data-icon="message-circle"></span><span id="inbox-badge" class="inbox-badge" aria-hidden="true" hidden></span></button></div>
+    <div class="header-end"><span class="free-label">Gratuit. Tout simplement.</span>
+      <details id="appearance-menu" class="appearance-menu"><summary aria-label="Fond de l’interface" title="Fond de l’interface"><span class="palette-symbol" aria-hidden="true"><i></i><i></i><i></i></span></summary><div class="appearance-panel"><fieldset><legend>Votre fond</legend><button type="button" data-appearance="notice" aria-pressed="true"><span class="theme-swatch notice-swatch" aria-hidden="true"></span>Crème<span class="theme-check" data-icon="check" aria-hidden="true"></span></button><button type="button" data-appearance="sage" aria-pressed="false"><span class="theme-swatch sage-swatch" aria-hidden="true"></span>Sauge<span class="theme-check" data-icon="check" aria-hidden="true"></span></button><button type="button" data-appearance="paper" aria-pressed="false"><span class="theme-swatch paper-swatch" aria-hidden="true"></span>Blanc<span class="theme-check" data-icon="check" aria-hidden="true"></span></button></fieldset><p>L’identité The Notice reste la même.</p></div></details>
+      <button id="inbox-button" disabled class="icon-button" aria-label="Mes échanges" title="Mes échanges"><span data-icon="message-circle"></span><span id="inbox-badge" class="inbox-badge" aria-hidden="true" hidden></span></button></div>
   </header>
   <main id="main">
+    <div id="live-content">
     <section class="intro" aria-labelledby="main-title">
       <div><h1 id="main-title">Ça se passe <span>maintenant.</span></h1><p>Un renfort ou une mission. Juste autour de vous.</p></div>
       <div class="primary-actions"><button class="button lime" id="available-button" disabled><span class="status-dot" aria-hidden="true"></span>Je suis dispo<span data-icon="arrow-up-right"></span></button><button class="button dark" id="need-button" disabled><span data-icon="plus"></span>J’ai besoin</button></div>
@@ -32,11 +37,13 @@
     <button id="reply-notice" class="reply-notice" hidden><span data-icon="message-circle"></span><span id="reply-notice-text" role="status"></span><span id="reply-notice-action">Voir les échanges</span><span data-icon="arrow-up-right"></span></button>
     <section class="controls" aria-label="Filtres des annonces">
       <div class="kind-tabs" role="group" aria-label="Type d’annonce"><button class="active" data-kind="all" aria-pressed="true">Les dernières<span id="all-count">—</span></button><button data-kind="available" aria-pressed="false"><span class="status-dot" aria-hidden="true"></span>Dispos<span id="available-count">—</span></button><button data-kind="need" aria-pressed="false">À pourvoir<span id="need-count">—</span></button></div>
-      <div class="filter-fields"><button class="filter-button city-button" id="city-button" disabled aria-label="Choisir une ville"><span data-icon="map-pin"></span><span id="city-name">Paris</span><span data-icon="chevron-down"></span></button><label class="select-wrap" id="zone-control"><span data-icon="map-pin"></span><span class="sr-only">Quartier</span><select id="zone-filter"><option value="all">Tout Paris</option></select></label><label class="select-wrap role-filter"><span class="sr-only">Métier</span><select id="role-filter"><option value="all">Tous les métiers</option></select></label><label class="select-wrap" id="sort-control" hidden><span class="sr-only">Trier les annonces à pourvoir</span><select id="sort-filter"><option value="recent">Plus récentes</option><option value="oldest">En attente depuis le plus longtemps</option></select></label><button class="filter-button" id="more-filters" aria-label="Filtres" aria-expanded="false" aria-controls="extra-filters"><span data-icon="sliders-horizontal"></span><span>Filtres</span><span id="filter-count" hidden></span></button></div>
+      <div class="filter-fields"><button class="filter-button city-button" id="city-button" disabled aria-label="Choisir une ville"><span data-icon="map-pin"></span><span id="city-name">Paris</span><span data-icon="chevron-down"></span></button><label class="select-wrap" id="zone-control"><span data-icon="map-pin"></span><span class="sr-only">Quartier</span><select id="zone-filter"><option value="all">Tout Paris</option></select></label><label class="select-wrap role-filter"><span id="role-filter-symbol" aria-hidden="true"></span><span class="sr-only">Métier</span><select id="role-filter"><option value="all">Tous les métiers</option></select></label><label class="select-wrap" id="sort-control" hidden><span class="sr-only">Trier les annonces à pourvoir</span><select id="sort-filter"><option value="recent">Plus récentes</option><option value="oldest">En attente depuis le plus longtemps</option></select></label><button class="filter-button" id="more-filters" aria-label="Filtres" aria-expanded="false" aria-controls="extra-filters"><span data-icon="sliders-horizontal"></span><span>Filtres</span><span id="filter-count" hidden></span></button></div>
     </section>
     <div id="extra-filters" class="extra-filters" hidden><label><input type="checkbox" id="english-filter"> Parle anglais</label><label><input type="checkbox" id="vehicle-filter"> Véhiculé</label><button id="reset-filters" class="text-button">Tout effacer</button></div>
-    <div class="feed-sharing"><button id="share-feed" class="text-button" disabled aria-describedby="feed-share-help"><span data-icon="share-2"></span>Partager ce fil</button><span id="feed-share-help">Ville, métier et type d’annonces uniquement.</span><p id="feed-link-notice" role="status" hidden></p><p id="feed-share-status" role="status" hidden></p><label id="feed-share-fallback" class="field-label" hidden>Texte et lien à copier<textarea id="feed-share-copy" readonly rows="4" spellcheck="false"></textarea></label></div>
+    <div class="workspace-actions">
+    <div class="feed-sharing"><button id="share-feed" class="text-button" disabled aria-describedby="feed-share-help"><span data-icon="share-2"></span><span class="share-feed-label">Partager ce fil</span></button><span id="feed-share-help">Ville, métier et type d’annonces uniquement.</span><p id="feed-link-notice" role="status" hidden></p><p id="feed-share-status" role="status" hidden></p><label id="feed-share-fallback" class="field-label" hidden>Texte et lien à copier<textarea id="feed-share-copy" readonly rows="4" spellcheck="false"></textarea></label></div>
     <div class="mobile-view-toggle" role="group" aria-label="Affichage"><button class="active" data-view="map" aria-pressed="true"><span data-icon="map"></span>Carte</button><button data-view="feed" aria-pressed="false"><span data-icon="list"></span>Fil en direct</button></div>
+    </div>
     <div class="workspace" data-mobile-view="map">
       <section class="feed" aria-label="Fil des annonces">
         <div class="feed-heading"><div><h2 id="feed-title" tabindex="-1" aria-describedby="result-count">Dans le coin</h2><p id="result-count">Connexion au fil…</p><p id="feed-limit" class="field-help" role="status" hidden></p></div><span id="connection" class="connection"><span class="status-dot"></span><span>Connexion…</span></span></div>
@@ -44,16 +51,20 @@
         <div class="feed-foot"><span data-icon="clock"></span><span id="feed-expiry">Les annonces expirent. Le fil reste frais.</span></div>
       </section>
       <section class="map-panel" aria-label="Carte des annonces par zone">
-        <div id="map" class="map" tabindex="0" aria-label="Carte de Paris. Flèches pour déplacer, plus et moins pour zoomer."><div id="map-tiles" class="map-tiles" aria-hidden="true"></div><div id="map-pins" class="map-pins"></div></div>
+        <div id="map" class="map" tabindex="0" aria-label="Carte de Paris. Flèches pour déplacer, plus et moins pour zoomer." aria-describedby="map-gesture-help"><div id="map-tiles" class="map-tiles" aria-hidden="true"></div><div id="map-pins" class="map-pins"></div></div>
         <div class="map-location"><span data-icon="map-pin"></span><span id="map-area">Paris, en direct</span></div>
+        <div class="map-explore" id="map-explore" hidden><button type="button" id="search-map-area"><span data-icon="search"></span>Chercher dans cette zone</button><p id="map-search-status" role="status">Le fil reste sur la zone sélectionnée.</p></div>
         <div class="map-legend"><span><i class="status-dot"></i>Dispo</span><span><i class="status-dot mission-dot"></i>À pourvoir</span><span id="full-legend" hidden><i class="status-dot full-dot"></i>Complet</span></div>
         <div class="map-tools"><button class="icon-button" id="zoom-in" aria-label="Zoomer" data-icon="plus"></button><button class="icon-button" id="zoom-out" aria-label="Dézoomer" data-icon="minus"></button><button class="icon-button" id="recenter" aria-label="Recentrer sur Paris" data-icon="locate-fixed"></button></div>
         <div id="map-selection" class="map-selection" hidden></div>
         <p id="map-error" class="map-error" hidden>Fond de carte indisponible. Les annonces restent accessibles dans le fil.</p>
+        <p id="map-gesture-help" class="map-gesture-help">Glissez pour explorer · Pincez pour zoomer<span class="sr-only">. Au clavier : flèches, plus, moins et touche Début pour revenir à la zone. À la souris : double-clic ou Ctrl et molette pour zoomer.</span></p>
         <div class="map-bottom"><span class="privacy-note"><span data-icon="shield-check"></span>Positions approximatives.</span><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap</a></div>
       </section>
     </div>
-    <footer class="page-footer"><p id="service-status"><span class="demo-dot"></span><strong>Prototype local</strong><span class="footer-separator">·</span>Les exemples sont fictifs. Vos essais se synchronisent entre fenêtres.</p><a class="notice-link" href="https://thenotice.io/" target="_blank" rel="noopener" aria-label="Découvrir The Notice">Par The Notice</a><button class="text-button" id="how-button">Comment ça marche ?<span data-icon="arrow-up-right"></span></button><a id="privacy-link" class="text-button" href="/privacy.html" hidden>Confidentialité</a><button id="install-app" class="text-button" type="button" hidden>Installer l’application</button><span id="install-status" role="status" aria-live="polite"></span></footer>
+    </div>
+    <section id="event-plans-panel" class="event-plans" aria-label="Préparation privée des événements" hidden></section>
+    <footer class="page-footer"><p id="service-status"><span class="demo-dot"></span><strong>Prototype local</strong><span class="footer-separator">·</span>Les exemples sont fictifs. Vos essais se synchronisent entre fenêtres.</p><a class="notice-link" href="https://thenotice.io/" target="_blank" rel="noopener" aria-label="Powered by TheNotice.io — ouvrir le site dans un nouvel onglet">Powered by TheNotice.io</a><button class="text-button" id="how-button">Comment ça marche ?<span data-icon="arrow-up-right"></span></button><a id="privacy-link" class="text-button" href="/privacy.html" hidden>Confidentialité</a><button id="install-app" class="text-button" type="button" hidden>Installer l’application</button><span id="install-status" role="status" aria-live="polite"></span></footer>
   </main>
   <dialog id="location-picker" class="sheet" aria-labelledby="location-title"><div class="sheet-inner"><button class="icon-button close-dialog" aria-label="Fermer" data-icon="x"></button><h2 id="location-title">Dans quel coin ?</h2><p class="sheet-subtitle">Une ville, ici ou ailleurs. Le fil reste local.</p><form id="location-search"><label class="field-label" for="location-query">Ville<input id="location-query" type="search" maxlength="80" minlength="2" placeholder="Paris, Lyon, Lisbonne…" required autocomplete="off"></label><button class="button lime" type="submit">Chercher une ville<span data-icon="search"></span></button></form><button id="use-location" class="button outline location-nearby"><span data-icon="locate-fixed"></span>Utiliser ma zone approximative</button><p class="fine-print">Seulement à votre demande. La position est arrondie avant envoi au serveur, à environ 1 km. Jamais de suivi continu. Les points ne sont pas des adresses exactes.</p><p id="location-status" role="status"></p><div id="location-results"></div><p class="fine-print">Villes et grandes localités : <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a> · <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>. Certaines petites communes peuvent manquer.</p></div></dialog>
   <dialog id="composer" class="sheet" aria-labelledby="compose-title"><div class="sheet-inner"><button class="icon-button close-dialog" aria-label="Fermer" data-icon="x"></button><div id="compose-symbol" class="compose-symbol" data-icon="radio"></div><h2 id="compose-title">Dispo, maintenant.</h2><p id="compose-description" class="sheet-subtitle">Quelques cases. Et vous êtes dans le coin.</p>
@@ -67,6 +78,7 @@
       <p class="form-note"><span data-icon="shield-check"></span>Zone approximative. Aucun nom, numéro ou email.</p><p class="form-error" id="form-error" role="alert" hidden></p><button class="button lime submit-post" type="submit" id="publish-button">Apparaître en direct<span data-icon="arrow-up-right"></span></button><p class="fine-print">Gratuit · Conditions et paiement à convenir entre vous.<br>Essai local · L’annonce disparaît à expiration.</p>
     </form>
   </div></dialog>
+  <dialog id="event-post-preview" class="sheet" aria-labelledby="event-post-preview-title"><div class="sheet-inner"><button type="button" class="icon-button close-dialog" aria-label="Fermer" data-icon="x"></button><div id="event-post-preview-content"></div></div></dialog>
   <dialog id="detail" class="sheet" aria-labelledby="detail-title"><div class="sheet-inner"><button class="icon-button close-dialog" aria-label="Fermer" data-icon="x"></button><div id="detail-content"></div></div></dialog>
   <dialog id="chat" class="sheet" aria-labelledby="chat-title"><div class="sheet-inner"><button class="icon-button close-dialog" aria-label="Fermer" data-icon="x"></button><h2 id="chat-title">En direct, à deux.</h2><p id="chat-subtitle" class="sheet-subtitle">Échange local, lié à la durée de l’annonce.</p><div id="chat-safety" class="safety-actions" hidden><button id="chat-block" class="text-button">Bloquer</button><button id="chat-report" class="text-button">Signaler</button></div><p id="chat-block-status" class="field-help" role="status"></p><div id="chat-messages" class="chat-messages" aria-live="polite"></div><div class="chat-compose"><form id="chat-form" class="chat-form"><label class="sr-only" for="chat-input">Votre message</label><input id="chat-input" maxlength="500" required placeholder="Écrivez votre message…" autocomplete="off"><button class="button lime" type="submit" aria-label="Envoyer" data-icon="send"></button></form><section id="voice-composer" class="voice-composer" aria-label="Message vocal" hidden>
     <button id="voice-record" class="text-button" type="button">Enregistrer un vocal</button>

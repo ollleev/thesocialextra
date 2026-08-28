@@ -178,11 +178,11 @@ async function inventory(directory) {
 
 // Library injection is for local tests/operators, never accepted from JSON or HTTP.
 export async function pullBackup(input, { transport, now = Date.now(), timeoutMs = 120000, signal: externalSignal,
-  maxStoredBytes = 4 * 1024 ** 3, minFreeBytes = 1024 ** 3, freeSpace = statfs } = {}) {
+  maxStoredBytes = 4 * 1024 ** 3, minFreeBytes = 1024 ** 3, freeSpace = statfs, pruneExpired = true } = {}) {
   let lock, work, key, timedOut = false;
   const controller = new AbortController(), signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
   if (!Number.isSafeInteger(now) || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 900000 ||
-    !Number.isSafeInteger(maxStoredBytes) || maxStoredBytes < 1 || !Number.isSafeInteger(minFreeBytes) || minFreeBytes < 0) throw fail('invalid_pull_policy');
+    !Number.isSafeInteger(maxStoredBytes) || maxStoredBytes < 1 || !Number.isSafeInteger(minFreeBytes) || minFreeBytes < 0 || typeof pruneExpired !== 'boolean') throw fail('invalid_pull_policy');
   const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
   try {
     const config = validateConfig(input);
@@ -217,7 +217,7 @@ export async function pullBackup(input, { transport, now = Date.now(), timeoutMs
       const target = await lstat(destination);
       if (!existing || !target.isFile() || target.isSymbolicLink() || (target.mode & 0o777) !== 0o600 || target.size !== latest.bytes) throw fail('destination_conflict');
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    const retainedBytes = snapshots.filter(item => item.createdAt >= cutoff).reduce((sum, item) => sum + item.bytes, 0);
+    const retainedBytes = snapshots.filter(item => !pruneExpired || item.createdAt >= cutoff).reduce((sum, item) => sum + item.bytes, 0);
     if (!Number.isSafeInteger(retainedBytes) || retainedBytes + (existing ? 0 : latest.bytes) > maxStoredBytes) throw fail('retention_budget');
     const capacity = await untilAbort(freeSpace(directory), signal);
     if (capacity.bavail * capacity.bsize < minFreeBytes + 3 * latest.bytes + 1024 ** 2) throw fail('insufficient_space');
@@ -245,7 +245,7 @@ export async function pullBackup(input, { transport, now = Date.now(), timeoutMs
     if (existing) return { filename: latest.name, bytes: latest.bytes, restoredIntegrity: 'ok', alreadyPresent: true, removed: 0 };
     await link(encrypted, destination); await syncDirectory(directory);
     let removed = 0;
-    for (const old of snapshots.filter(item => item.createdAt < cutoff)) {
+    for (const old of snapshots.filter(item => pruneExpired && item.createdAt < cutoff)) {
       abortCheck(signal);
       const current = await lstat(old.filename);
       if (current.isFile() && !current.isSymbolicLink() && current.dev === old.dev && current.ino === old.ino) { await unlink(old.filename); removed++; }

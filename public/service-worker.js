@@ -1,7 +1,7 @@
 // Deliberately not an offline app shell. Only this public, self-contained
 // fallback is cached. Never cache pages, API responses, accounts or messages.
 const CACHE_PREFIX = 'thesocialextra-offline-';
-const CACHE_NAME = `${CACHE_PREFIX}v1`;
+const CACHE_NAME = `${CACHE_PREFIX}v2`;
 const OFFLINE_URL = '/offline.html';
 const NAVIGATION_PATHS = new Set(['/', '/index.html', '/privacy.html', OFFLINE_URL]);
 

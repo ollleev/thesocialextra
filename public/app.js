@@ -4,6 +4,8 @@ import { preserveLiveFocus, captureLiveOpener, restoreLiveOpener } from './live-
 import { mergeSummary, markRead, unreadCount, freshPost, suggestedDraft } from './updates.js';
 import { MessageOutbox, requestJSON as api } from './requests.js';
 import { createAccountUI } from './accounts.js';
+import { createEventPlansUI } from './event-plans.js';
+import { roleVisual } from './role-visuals.js';
 import { makeFeedShare, parseFeedLink } from './sharing.js';
 import { VoiceComposer, uploadVoice } from './voice.js';
 import { createBlockUI } from './blocks.js';
@@ -70,6 +72,7 @@ const accounts = createAccountUI({openDialog,onError:errorText,onChange:async se
   }
   renderVoice();
   presentationUI.changed();
+  eventPlansUI.changed();
   rulesUI.changed();
   if(liveReady) { void changeFeed();void pollUpdates(); }
 }});
@@ -77,6 +80,9 @@ $('#account-button').addEventListener('click',()=>accounts.show());
 const blockUI=createBlockUI({$,api,requireAccount:next=>accounts.require(next),getGeneration:()=>accountGeneration,openDialog,errorText,toast,onRevision:applyFeedRevision,refreshFeed:async()=>{await changeFeed();void pollUpdates();void refreshChat();}});
 const rulesUI=createRulesUI({$,api,getSession:()=>accounts.session,getGeneration:()=>accountGeneration,refreshSession:()=>accounts.refresh(),applyRules:rules=>accounts.updateRules(rules),errorText,beforeOpen:()=>{if(voice.phase==='requesting')voice.discard();else if(voice.phase==='recording')voice.stop();}});
 const presentationUI=createPresentationUI({$,api,openDialog,errorText,getGeneration:()=>accountGeneration,getSession:()=>accounts.session,requireUGC:next=>requireUGC(next),onRulesError:(error,next,account)=>rulesError(error,next,account),onPublicChange:()=>refreshPublicState(),onReport:(id,version)=>openReport('post',id,version),now:()=>now()});
+const eventPlansUI=createEventPlansUI({$,api,openDialog,getSession:()=>accounts.session,getCity:()=>state.city,requireAccount:next=>accounts.require(next),requireUGC:next=>requireUGC(next),onRulesError:(error,next)=>rulesError(error,next),onSessionError:async()=>{try{await accounts.refresh();}catch(error){toast(errorText(error));}},errorText,now:()=>now(),publishPost:publishEventPost,onViewPost:id=>{setMine(true);state.selected=id;openDetail(id);}});
+$('#events-nav').addEventListener('click',()=>eventPlansUI.show());
+window.addEventListener('beforeunload',event=>{if(eventPlansUI.hasDraft()){event.preventDefault();event.returnValue='';}});
 function requireUGC(next) {if(!accounts.require(()=>{if(rulesUI.require(next))next?.();}))return false;return rulesUI.require(next);}
 function rulesError(error,next,account=accountGeneration) {if(account!==accountGeneration||!['rules_acceptance_required','rules_version_changed'].includes(error.code))return false;void rulesUI.renew(next);return true;}
 let composerGeneration = 0, publishing = false;
@@ -86,6 +92,7 @@ let updatesRequest, updatesCursor = 0, updatesError = false, updatesCheckedAt = 
 function toast(message) { clearTimeout(toastTimer); $('#toast').textContent = message; $('#toast').hidden = false; toastTimer = setTimeout(() => $('#toast').hidden = true, 4500); }
 function errorText(error) {
   if(error.code==='storage_capacity_reached')return 'Le stockage du service est plein. Cette opération n’a pas été enregistrée. Réessayez plus tard ; vos contenus existants ne sont pas effacés pour faire de la place.';
+  if(error.code==='account_erasure_pending')return 'Le service est temporairement suspendu pour sécuriser une suppression de compte. Sa fin n’est pas encore confirmée. Réessayez plus tard.';
   const presentationMessage=presentationError(error,()=>null);if(presentationMessage)return presentationMessage;
   if(error.code==='rules_acceptance_required')return 'Acceptez les règles de publication pour publier ou envoyer un message. Votre brouillon est conservé.';
   if(error.code==='rules_version_changed')return 'Les règles ont changé. Lisez la nouvelle version puis cochez à nouveau la case.';
@@ -105,13 +112,42 @@ function relative(timestamp) { const minutes = Math.max(0, Math.floor((now() - t
 function remaining(post) { const m = Math.max(0, Math.ceil((post.expiresAt - now()) / 60000)); return m >= 60 ? `${Math.floor(m / 60)} h${m % 60 ? ` ${String(m % 60).padStart(2, '0')}` : ''}` : `${m} min`; }
 function time(timestamp, timezone) { return new Intl.DateTimeFormat('fr-FR', { hour: '2-digit', minute: '2-digit', ...(timezone ? { timeZone: timezone } : {}) }).format(timestamp); }
 function dateTime(timestamp,timezone) {return new Intl.DateTimeFormat('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit',...(timezone?{timeZone:timezone}:{})}).format(timestamp);}
-const roleIcon = role => role === 'Barman' ? 'wine' : role === 'Commis' ? 'chef-hat' : 'utensils';
+function roleSymbol(role, variant = 'role-symbol') {
+  const visual = roleVisual(role);
+  return `<span class="${variant} profession-symbol" data-role-key="${visual.key}" style="--role-ink:${visual.ink};--role-paper:${visual.paper}" aria-hidden="true">${icon(visual.icon)}</span>`;
+}
+function mapPinHTML(post) {
+  const status = post.status === 'full' ? 'Clôturé' : post.kind === 'need' ? `${esc(post.places)} pl.` : 'Dispo';
+  return `${roleSymbol(post.role, 'map-role-symbol')}<span class="status-dot" aria-hidden="true"></span>${esc(post.role)}<small>${status}</small>`;
+}
+const missionNote = post => typeof post.note === 'string' && post.note.startsWith('Mission : ') ? post.note : '';
 function statusLabel(post) { if (post.status === 'full') return post.kind === 'need' ? 'COMPLET' : 'INDISPONIBLE'; return post.kind === 'available' ? 'DISPO MAINTENANT' : 'RENFORT RECHERCHÉ'; }
 function title(post) { return post.kind === 'need' ? `${post.places || post.totalPlaces} ${post.role.toLowerCase()}${(post.places || post.totalPlaces) > 1 ? 's' : ''} recherché${(post.places || post.totalPlaces) > 1 ? 's' : ''}` : post.role; }
 function tags(post) { return `${post.english ? `<span>${icon('languages')}Anglais</span>` : ''}${post.vehicle ? `<span>${icon('car')}Véhiculé</span>` : ''}${post.kind === 'need' && post.status === 'open' ? `<span class="places-label">${post.places} place${post.places > 1 ? 's' : ''}</span>` : ''}${post.pay ? `<span class="pay-label">${esc(post.pay)} €/h</span>` : ''}`; }
 function inCity(post) { if (state.mine) return true; const origin = state.point || state.city, rad = Math.PI / 180; const a = Math.sin((post.lat-origin.lat)*rad/2)**2 + Math.cos(origin.lat*rad)*Math.cos(post.lat*rad)*Math.sin((post.lng-origin.lng)*rad/2)**2; return 6371*2*Math.atan2(Math.sqrt(Math.min(1,a)), Math.sqrt(Math.max(0,1-a))) <= 25; }
 function visiblePosts() { if(state.feedPending||state.feedError)return [];return state.posts.filter(post => (state.mine||!state.feedIds||state.feedIds.has(post.id)) && inCity(post) && post.expiresAt > now() && (state.mine || post.status === 'open') && (!state.mine || owners[post.id]) && (state.kind === 'all' || post.kind === state.kind) && (state.zone === 'all' || post.zoneId === state.zone) && (state.role === 'all' || post.role === state.role) && (!state.english || post.english) && (!state.vehicle || post.vehicle)).sort((a, b) => state.kind === 'need' && state.sort === 'oldest' ? a.createdAt - b.createdAt : b.createdAt - a.createdAt); }
-const map = new LocalMap($('#map'), { pinHTML: post => `<span class="status-dot"></span>${esc(post.role)}${post.kind === 'need' ? `<small>${post.places}</small>` : ''}`, onSelect: id => selectPost(id), onOverflow: () => { setView('feed'); $('#feed-title').scrollIntoView({block:'center'}); } });
+let mapAreaRequest=0,mapCenterKey='';
+const map = new LocalMap($('#map'), { pinHTML: mapPinHTML, onSelect: id => selectPost(id), onOverflow: () => { setView('feed'); $('#feed-title').focus({preventScroll:true}); $('#feed-title').scrollIntoView({block:'center'}); },onViewChange:({center,zoom,moved})=>{
+  $('#zoom-in').disabled=zoom>=16;$('#zoom-out').disabled=zoom<=2;
+  $('#map-explore').hidden=!moved||!state.production;
+  const key=`${center.lat}:${center.lng}`;
+  if(key!==mapCenterKey){mapCenterKey=key;mapAreaRequest++;$('#search-map-area').disabled=false;$('#map-search-status').textContent='Le fil reste sur la zone sélectionnée.';}
+} });
+async function searchMapArea(){
+  if(!state.production)return;
+  const request=++mapAreaRequest,button=$('#search-map-area');
+  const point={lat:Number(map.center.lat.toFixed(2)),lng:Number(map.center.lng.toFixed(2))};
+  button.disabled=true;$('#map-search-status').textContent='Recherche des annonces dans cette zone…';
+  try {
+    const {location:city}=await api(`/api/locations/nearest?lat=${point.lat}&lng=${point.lng}`);
+    if(request!==mapAreaRequest)return;
+    const returnFocus=document.activeElement===button;
+    setCity(city,point);toast(`Zone sélectionnée autour de ${city.name}, dans un rayon de 25 km.`);
+    if(returnFocus)$('#map').focus({preventScroll:true});
+  }catch(error){if(request===mapAreaRequest)$('#map-search-status').textContent=['location_too_far','point_too_far_from_city','no_nearby_location'].includes(error.code)?'Pas de ville proche. Déplacez la carte ou choisissez une ville.':errorText(error);}
+  finally{if(request===mapAreaRequest)button.disabled=false;}
+}
+$('#search-map-area').addEventListener('click',searchMapArea);
 function render() {
   return preserveLiveFocus($('#post-list'), () => {
   const active = state.posts.filter(p => inCity(p) && p.expiresAt > now() && p.status === 'open' && (!state.mine || owners[p.id]));
@@ -131,10 +167,10 @@ function render() {
   } else if (!visible.length) {
     $('#post-list').innerHTML = `<div class="empty-state">${icon(state.mine ? 'radio' : 'map-pin')}<h3>${state.mine ? 'À vous d’apparaître.' : 'Le coin est calme.'}</h3><p>${state.mine ? 'Une dispo ou un besoin ? Quelques cases suffisent.' : 'Aucune annonce ne correspond à ces filtres. Élargissez la recherche ou lancez la première.'}</p><button class="button lime" data-empty-action data-focus-key="publish-empty">${state.mine ? 'Je suis dispo' : 'Publier une annonce'}${icon('plus')}</button></div>`;
   } else {
-    $('#post-list').innerHTML = visible.map(post => `<button class="post-row ${post.kind} ${state.selected === post.id ? 'selected' : ''}" data-post="${esc(post.id)}" data-focus-key="post-${esc(post.id)}" aria-label="${esc(title(post))}, ${esc(post.zoneLabel)}, ${esc(statusLabel(post))}${post.demo ? ', exemple' : ''}"><div class="row-top"><span class="state-label ${post.kind === 'need' ? 'need' : ''} ${post.status === 'full' ? 'full' : ''}"><span class="status-dot"></span>${statusLabel(post)}</span><span class="row-age">${relative(post.updatedAt)}</span></div><div class="row-main"><span class="role-symbol">${icon(roleIcon(post.role))}</span><div class="row-text"><h3>${esc(title(post))}</h3><p>${icon('map-pin')}${esc(post.zoneLabel)} <span aria-hidden="true">·</span> ${post.status === 'full' ? 'Clôturé' : `Encore ${remaining(post)}`}</p></div>${icon('arrow-up-right', 'class="row-arrow"')}</div><div class="row-tags">${tags(post)}<span class="demo-label">${post.demo ? 'Exemple' : owners[post.id] ? 'Votre annonce' : state.production ? 'Annonce locale' : 'Essai local'}</span></div></button>`).join('');
+    $('#post-list').innerHTML = visible.map(post => `<button class="post-row ${post.kind} ${state.selected === post.id ? 'selected' : ''}" data-post="${esc(post.id)}" data-focus-key="post-${esc(post.id)}" ${missionNote(post) ? `aria-describedby="post-note-${esc(post.id)}"` : ''} aria-label="${esc(title(post))}, ${esc(post.zoneLabel)}, ${esc(statusLabel(post))}${post.demo ? ', exemple' : ''}"><div class="row-top"><span class="state-label ${post.kind === 'need' ? 'need' : ''} ${post.status === 'full' ? 'full' : ''}"><span class="status-dot"></span>${statusLabel(post)}</span><span class="row-age">${relative(post.updatedAt)}</span></div><div class="row-main">${roleSymbol(post.role)}<div class="row-text"><h3>${esc(title(post))}</h3><p>${icon('map-pin')}${esc(post.zoneLabel)} <span aria-hidden="true">·</span> ${post.status === 'full' ? 'Clôturé' : `Encore ${remaining(post)}`}</p>${missionNote(post) ? `<p class="mission-note" id="post-note-${esc(post.id)}">${esc(missionNote(post))}</p>` : ''}</div>${icon('arrow-up-right', 'class="row-arrow"')}</div><div class="row-tags">${tags(post)}<span class="demo-label">${post.demo ? 'Exemple' : owners[post.id] ? 'Votre annonce' : state.production ? 'Annonce locale' : 'Essai local'}</span></div></button>`).join('');
   }
   if (state.selected && !visible.some(p => p.id === state.selected)) state.selected = null;
-  map.update(visible, state.selected); renderSelection();
+  renderSelection(); map.update(visible, state.selected);
   const extra = Number(state.english) + Number(state.vehicle); $('#filter-count').hidden = !extra; $('#filter-count').textContent = extra;
   if (state.detailId && $('#detail').open) {
     const p = state.posts.find(p => p.id === state.detailId && p.expiresAt > now());
@@ -210,6 +246,17 @@ function openComposer(kind) {
   $('#form-error').hidden = true; $('#form-city').textContent = `${state.city.label}${state.point ? ' · votre zone approximative' : ''}`; $('#form-zone-control').hidden = state.city.id !== '2988507' || Boolean(state.point); $('#form-zone').disabled = $('#form-zone-control').hidden; if (state.zone !== 'all') $('#form-zone').value = state.zone;
   openDialog($('#composer'));
 }
+async function publishEventPost({draft, key}) {
+  const generation = accountGeneration;
+  const result = await api('/api/posts', { method: 'POST', body: draft, idempotencyKey: key });
+  if (generation !== accountGeneration) throw Object.assign(new Error('login_required'), { code: 'login_required', definitive: true });
+  if (typeof result?.post?.id !== 'string' || !result.post.id) throw Object.assign(new Error('invalid_post_response'), { code: 'invalid_post_response' });
+  owners[result.post.id] = true;
+  const index = state.posts.findIndex(post => post.id === result.post.id);
+  if (index < 0) state.posts.push(result.post); else state.posts[index] = freshPost(state.posts[index], result.post);
+  saveSession(); render();
+  return result;
+}
 $('#available-button').addEventListener('click', () => openComposer('available')); $('#need-button').addEventListener('click', () => openComposer('need'));
 $('#post-form').addEventListener('submit', async event => {
   event.preventDefault(); const button = $('#publish-button'); if (button.disabled) return;
@@ -244,6 +291,7 @@ $('#post-form').addEventListener('submit', async event => {
 });
 function syncFilters() {
   $('#zone-filter').value = state.zone; $('#role-filter').value = state.role; $('#english-filter').checked = state.english; $('#vehicle-filter').checked = state.vehicle; $('#sort-filter').value = state.sort; $('#sort-control').hidden = state.kind !== 'need';
+  $('#role-filter-symbol').innerHTML = roleSymbol(state.role, 'filter-role-symbol');
   $$('[data-kind]').forEach(button => { button.classList.toggle('active', button.dataset.kind === state.kind); button.setAttribute('aria-pressed', String(button.dataset.kind === state.kind)); });
 }
 function filtersChanged() {syncFilters();if(state.production&&liveReady)void changeFeed();else render();}
@@ -254,7 +302,7 @@ $('#sort-filter').addEventListener('change', e => { state.sort = e.target.value;
 for (const [selector, key] of [['#english-filter', 'english'], ['#vehicle-filter', 'vehicle']]) $(selector).addEventListener('change', e => { state[key] = e.target.checked; filtersChanged(); });
 $('#more-filters').addEventListener('click', () => { const hidden = !$('#extra-filters').hidden; $('#extra-filters').hidden = hidden; $('#more-filters').setAttribute('aria-expanded', String(!hidden)); });
 $('#reset-filters').addEventListener('click', () => { Object.assign(state, { kind: 'all', zone: 'all', role: 'all', sort: 'recent', english: false, vehicle: false }); map.recenter(state.city); filtersChanged(); });
-function setMine(mine) { if(mine&&!accounts.require(()=>setMine(true))) return; state.mine = mine; $('#mine-nav').classList.toggle('active', mine); $('#live-nav').classList.toggle('active', !mine); (mine ? $('#mine-nav') : $('#live-nav')).setAttribute('aria-current', 'page'); (mine ? $('#live-nav') : $('#mine-nav')).removeAttribute('aria-current'); syncFilters(); if (mine) setView('feed'); if(state.production) void changeFeed();render(); }
+function setMine(mine) { if(mine&&!accounts.require(()=>setMine(true))) return; eventPlansUI.hide(); state.mine = mine; $('#mine-nav').classList.toggle('active', mine); $('#live-nav').classList.toggle('active', !mine); (mine ? $('#mine-nav') : $('#live-nav')).setAttribute('aria-current', 'page'); (mine ? $('#live-nav') : $('#mine-nav')).removeAttribute('aria-current'); syncFilters(); if (mine) setView('feed'); if(state.production) void changeFeed();render(); }
 $('#mine-nav').addEventListener('click', () => setMine(true)); $('#live-nav').addEventListener('click', () => setMine(false));
 function setView(view) { $('.workspace').dataset.mobileView = view; $$('[data-view]').forEach(b => { b.classList.toggle('active', b.dataset.view === view); b.setAttribute('aria-pressed', String(b.dataset.view === view)); }); if (view === 'map') requestAnimationFrame(() => map.render()); }
 $$('[data-view]').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
@@ -342,7 +390,7 @@ function openDetail(id) {
   const post = state.posts.find(p => p.id === id && p.expiresAt > now()); if (!post) { toast('Cette annonce a expiré.'); return; }
   detailOpener = captureLiveOpener([$('#post-list'),$('#map-pins'),$('#map-selection')]) || (state.detailId===id ? detailOpener : null);
   state.detailId = id;state.detailPost=post;state.detailUnavailable=false; const own = Boolean(owners[id]);
-  $('#detail-content').innerHTML = `<div class="detail-role">${icon(roleIcon(post.role))}</div><div class="detail-state" aria-live="polite"><span id="detail-status" class="state-label"><span class="status-dot"></span><span id="detail-status-text"></span></span></div><h2 id="detail-title">${esc(title(post))}.</h2><p class="sheet-subtitle">${esc(post.zoneLabel)} · ${post.demo ? 'Exemple fictif' : own ? 'Votre annonce' : state.production ? 'Annonce locale' : 'Essai local'}</p><div class="detail-facts"><div>${icon('clock')}<span id="detail-expiration"></span></div>${post.english ? `<div>${icon('languages')}${post.kind === 'need' ? 'Anglais demandé' : 'Parle anglais'}</div>` : ''}${post.vehicle ? `<div>${icon('car')}${post.kind === 'need' ? 'Véhicule demandé' : 'Véhiculé'}</div>` : ''}${post.kind === 'need' ? `<div>${icon('briefcase-business')}<strong id="detail-places" aria-live="polite"></strong></div>` : ''}${post.pay ? `<div>${icon('check')}${esc(post.pay)} €/h annoncé · à confirmer ensemble</div>` : ''}</div>${post.note ? `<p class="detail-note">${esc(post.note)}</p>` : ''}<details id="detail-presentation" class="presentation-option" hidden><summary>Voir la présentation</summary><div data-presentation-content class="presentation-media"></div></details><p id="detail-closed" class="detail-disclaimer" role="status" hidden></p>
+  $('#detail-content').innerHTML = `${roleSymbol(post.role, 'detail-role')}<div class="detail-state" aria-live="polite"><span id="detail-status" class="state-label"><span class="status-dot"></span><span id="detail-status-text"></span></span></div><h2 id="detail-title">${esc(title(post))}.</h2><p class="sheet-subtitle">${esc(post.zoneLabel)} · ${post.demo ? 'Exemple fictif' : own ? 'Votre annonce' : state.production ? 'Annonce locale' : 'Essai local'}</p><div class="detail-facts"><div>${icon('clock')}<span id="detail-expiration"></span></div>${post.english ? `<div>${icon('languages')}${post.kind === 'need' ? 'Anglais demandé' : 'Parle anglais'}</div>` : ''}${post.vehicle ? `<div>${icon('car')}${post.kind === 'need' ? 'Véhicule demandé' : 'Véhiculé'}</div>` : ''}${post.kind === 'need' ? `<div>${icon('briefcase-business')}<strong id="detail-places" aria-live="polite"></strong></div>` : ''}${post.pay ? `<div>${icon('check')}${esc(post.pay)} €/h annoncé · à confirmer ensemble</div>` : ''}</div>${post.note ? `<p class="detail-note">${esc(post.note)}</p>` : ''}<details id="detail-presentation" class="presentation-option" hidden><summary>Voir la présentation</summary><div data-presentation-content class="presentation-media"></div></details><p id="detail-closed" class="detail-disclaimer" role="status" hidden></p>
   ${post.demo ? `<p class="detail-disclaimer">Cette annonce illustre le service. Aucune personne réelle n’est derrière cet exemple. Publiez un essai et ouvrez-le dans une autre fenêtre pour tester le contact.</p><button class="button lime" data-try>Créer mon essai${icon('plus')}</button>` : own ? `<div class="detail-actions">${post.kind === 'need' ? `<button class="button lime" data-mutate="fill">Une place confirmée${icon('check')}</button>` : ''}<button class="button outline" data-mutate="close">${post.kind === 'need' ? 'Tout est pourvu' : 'Je ne suis plus dispo'}</button><button class="button lime" data-mutate="reopen">${post.kind === 'need' ? 'Rouvrir une place' : 'Je suis de nouveau dispo'}${icon('plus')}</button><button class="button outline" data-owner-inbox>Voir les réponses${icon('message-circle')}</button></div><p class="detail-disclaimer">${post.kind === 'need' ? 'Confirmez une place seulement après accord avec la personne. Un message ne réserve rien.' : 'Votre disponibilité expire automatiquement.'}</p>` : `<form id="contact-form" class="contact-form"><label class="field-label" for="contact-message">Votre premier message</label><p class="quick-reply-help">Un clic préremplit le message. À vous de l’envoyer.</p><div class="quick-replies" role="group" aria-label="Suggestions de premier message">${(post.kind === 'need' ? ['Bonjour, votre besoin est-il toujours d’actualité ?', 'Bonjour, quels sont les horaires ?'] : ['Bonjour, êtes-vous toujours disponible ?', 'Bonjour, pour quels horaires êtes-vous disponible ?']).map(text => `<button type="button" data-suggestion="${esc(text)}">${esc(text)}</button>`).join('')}</div><textarea id="contact-message" maxlength="500" required placeholder="Bonjour, toujours disponible ?"></textarea><button class="button lime" type="submit">Contacter directement${icon('send')}</button><p class="detail-disclaimer">${state.production?'Échange privé. Convenez des horaires et conditions ensemble.':'Échange dans ce prototype, sans coordonnées personnelles.'} Une réponse ne réserve aucune place.</p></form>`}${state.production?`<div class="safety-actions">${own?'<button class="text-button" data-delete-post>Supprimer l’annonce</button>':'<button class="text-button" data-report-post>Signaler cette annonce</button><button class="text-button" data-block-author>Bloquer ce compte</button>'}</div>`:''}<p id="detail-error" class="form-error" role="alert" hidden></p><button class="text-button" data-share>${icon('share-2')}Copier le lien de cette annonce</button><p class="fine-print">${state.production?'Lien partageable · L’annonce disparaît à expiration.':'Lien de test local · Ne fonctionne pas sur un autre appareil.'}</p>`;
   updateDetail(post); openDialog($('#detail'));
   const form = $('#contact-form'); if (form) form.addEventListener('submit', async e => {
@@ -693,6 +741,7 @@ $('#chat-form').addEventListener('submit', async e => {
 
 let cityResults = [], cityRequest = 0;
 function setCity(city, point = null) {
+  mapAreaRequest++;
   state.city = city; state.point = point; state.zone = 'all'; state.selected = null;
   $('#city-name').textContent = city.name;
   $('#city-button').setAttribute('aria-label', `Choisir une ville, actuellement ${city.name}`);

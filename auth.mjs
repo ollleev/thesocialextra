@@ -42,9 +42,11 @@ export class AuthService {
   #kdf;
   #maxUsers;
   #rules;
-  constructor({ db, clock = Date.now, testKdf, testRules, maxUsers = 10000 } = {}) {
+  #beforeMutation;
+  constructor({ db, clock = Date.now, testKdf, testRules, maxUsers = 10000, beforeMutation = () => {} } = {}) {
     if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') throw new TypeError('DatabaseSync required');
     if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+    if (typeof beforeMutation !== 'function') throw new TypeError('beforeMutation must be a function');
     if (!Number.isSafeInteger(maxUsers) || maxUsers < 1) throw new TypeError('maxUsers must be a positive safe integer');
     if (testKdf !== undefined && (!process.env.NODE_TEST_CONTEXT || typeof testKdf !== 'function')) throw new TypeError('KDF injection is only available to the native test runner');
     if (testRules !== undefined && (!process.env.NODE_TEST_CONTEXT || !testRules || !/^\d{4}-\d{2}-\d{2}\.\d{1,4}$/.test(testRules.version) ||
@@ -53,7 +55,7 @@ export class AuthService {
     }
     const rules = testRules ?? RULES;
     this.#rules = Object.freeze({ version: rules.version, sha256: rules.sha256, url: rules.url });
-    this.#db = db; this.#clock = clock; this.#kdf = testKdf ?? nativeKdf; this.#maxUsers = maxUsers;
+    this.#db = db; this.#clock = clock; this.#kdf = testKdf ?? nativeKdf; this.#maxUsers = maxUsers; this.#beforeMutation = beforeMutation;
     db.exec(`
       CREATE TABLE IF NOT EXISTS auth_users (
         id TEXT PRIMARY KEY,
@@ -95,6 +97,8 @@ export class AuthService {
     });
   }
   #transaction(operation) {
+    // Synchronous maintenance guard: it must throw before any write begins.
+    this.#beforeMutation();
     // Savepoints also compose with a caller's synchronous business transaction.
     const name = `auth_${++savepointSequence}`;
     this.#db.exec(`SAVEPOINT ${name}`);
@@ -152,7 +156,7 @@ export class AuthService {
       return { user, sessionToken: this.#newSession(user.id), recoveryCode, rules:this.rulesStatus(user.id) };
     });
   }
-  async login(input) {
+  async #passwordCandidate(input) {
     fields(input, ['username', 'password']);
     const name = username(input.username), cleartext = password(input.password);
     const user = this.#db.prepare('SELECT * FROM auth_users WHERE username = ?').get(name);
@@ -165,13 +169,27 @@ export class AuthService {
     const actual = await this.#derive(cleartext, salt);
     const matched = timingSafeEqual(actual, expected);
     if (!usable || !matched) fail(401, 'invalid_credentials');
+    return user;
+  }
+  #currentPasswordUser(candidate) {
+    // Recheck after the KDF, and inside the session transaction for login.
+    // Recovery or deletion must invalidate the credentials checked earlier.
+    const current = this.#db.prepare('SELECT id, username FROM auth_users WHERE id = ? AND password_hash = ? AND password_salt = ?')
+      .get(candidate.id, candidate.password_hash, candidate.password_salt);
+    if (!current) fail(401, 'invalid_credentials');
+    return publicUser(current);
+  }
+  async verifyPassword(input) {
+    // Credential proof only; the HTTP caller must also revalidate its session.
+    // No session creation, expiry cleanup or transaction is needed here.
+    const candidate = await this.#passwordCandidate(input);
+    return this.#currentPasswordUser(candidate);
+  }
+  async login(input) {
+    const candidate = await this.#passwordCandidate(input);
     return this.#transaction(() => {
-      // A recovery/deletion during await must not let the old password create a
-      // fresh session after the recovery revoked its existing sessions.
-      const current = this.#db.prepare('SELECT id, username FROM auth_users WHERE id = ? AND password_hash = ? AND password_salt = ?')
-        .get(user.id, user.password_hash, user.password_salt);
-      if (!current) fail(401, 'invalid_credentials');
-      return { user: publicUser(current), sessionToken: this.#newSession(current.id), rules:this.rulesStatus(current.id) };
+      const current = this.#currentPasswordUser(candidate);
+      return { user: current, sessionToken: this.#newSession(current.id), rules:this.rulesStatus(current.id) };
     });
   }
   session(sessionToken) {
@@ -182,6 +200,7 @@ export class AuthService {
     return user ? publicUser(user) : null;
   }
   logout(sessionToken) {
+    this.#beforeMutation();
     if (validToken(sessionToken)) this.#db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').run(secretHash(sessionToken));
   }
   async recover(input) {

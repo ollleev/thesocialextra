@@ -4,7 +4,40 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { MessageOutbox, requestJSON } from '../public/requests.js';
 import { preserveLiveFocus, captureLiveOpener, restoreLiveOpener } from '../public/live-focus.js';
-import { LocalMap } from '../public/map.js';
+import { LocalMap, project, gestureView, zoomViewAt, reservedMapAreas } from '../public/map.js';
+import {createAppearance} from '../public/appearance.js';
+import {roleVisual} from '../public/role-visuals.js';
+import {ROLES} from '../domain.mjs';
+import {icons} from '../public/icons.js';
+
+test('role category icons remain legible and cover the live catalogue without status colours',()=>{
+  const luminance=hex=>hex.slice(1).match(/../g).map(v=>parseInt(v,16)/255).map(v=>v<=.04045?v/12.92:((v+.055)/1.055)**2.4).reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
+  const colours=new Set();
+  for(const role of ROLES){
+    const visual=roleVisual(role);
+    assert.notEqual(visual.key,'other',role);assert.ok(icons[visual.icon],role);
+    assert.ok((luminance(visual.paper)+.05)/(luminance(visual.ink)+.05)>=4.5,`${role}: insufficient contrast`);
+    assert.ok(!colours.has(visual.ink),`${role}: indistinguishable category colour`);colours.add(visual.ink);
+    assert.ok(Object.isFrozen(visual));
+  }
+  for(const unknown of ['__proto__','constructor','<img src=x>',undefined,{},'all'])assert.equal(roleVisual(unknown).key,'other');
+});
+
+test('actual map role markup keeps the role label and status separate and escapes unknown input',()=>{
+  const source=readFileSync(new URL('../public/app.js',import.meta.url),'utf8');
+  const context=vm.createContext({roleVisual,icon:name=>`<svg data-icon="${name}"></svg>`,esc:value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))});
+  vm.runInContext(['roleSymbol','mapPinHTML'].map(name=>source.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n}`))[0]).join('\n'),context);
+  const available=context.mapPinHTML({role:'Plongeur',kind:'available',status:'open'});
+  const needed=context.mapPinHTML({role:'Plongeur',kind:'need',status:'open',places:3});
+  const closed=context.mapPinHTML({role:'Plongeur',kind:'need',status:'full',places:0});
+  for(const html of [available,needed,closed]){
+    assert.match(html,/data-role-key="plonge"/);assert.match(html,/class="status-dot" aria-hidden="true"><\/span>Plongeur/);
+    assert.ok(html.startsWith(context.roleSymbol('Plongeur','map-role-symbol')));
+  }
+  assert.match(needed,/<small>3 pl\.<\/small>/);assert.match(available,/<small>Dispo<\/small>/);assert.match(closed,/<small>Clôturé<\/small>/);
+  const unsafe=context.mapPinHTML({role:'<img src=x>',kind:'need',places:'<script>'});
+  assert.match(unsafe,/data-role-key="other"/);assert.match(unsafe,/&lt;img src=x&gt;/);assert.doesNotMatch(unsafe,/<img|<script/);
+});
 
 function focusFixture() {
   const document={body:{isConnected:true},activeElement:null,querySelector(){return this.openDialog??null;}};document.activeElement=document.body;
@@ -56,6 +89,28 @@ test('actual map pin redraw preserves its focused post and falls back to map aft
   LocalMap.prototype.renderPins.call(map);const second=f.container.children.find(node=>node.dataset.post);
   assert.notEqual(first,second);assert.equal(f.document.activeElement,second);assert.equal(second.dataset.focusKey,'post-synthetic-post');
   map.posts=[];LocalMap.prototype.renderPins.call(map);assert.equal(f.document.activeElement,element);
+});
+
+test('map controls reserve visible geometry and an occluded pin remains reachable through the feed',t=>{
+  const hidden={getClientRects:()=>[]};
+  const control={getClientRects:()=>[{}],getBoundingClientRect:()=>({left:10,top:20,width:400,height:400})};
+  const f=focusFixture(),oldDocument=globalThis.document;globalThis.document=f.document;t.after(()=>{globalThis.document=oldDocument;});
+  const element=Object.assign(f.fallback,{clientWidth:400,clientHeight:400,getBoundingClientRect:()=>({left:10,top:20}),closest:()=>({querySelectorAll:()=>[control,hidden]})});
+  assert.deepEqual(reservedMapAreas(element),[{x:200,y:200,w:400,h:400}]);
+  const map={element,pins:f.container,center:{lat:48.86,lng:2.35},zoom:13,fresh:new Map(),selected:null,pinHTML:()=>'',
+    posts:[{id:'covered-post',lat:48.86,lng:2.35,role:'Plongeur',zoneLabel:'Zone synthétique',status:'open',kind:'available'}]};
+  LocalMap.prototype.renderPins.call(map);
+  assert.equal(f.container.children.filter(n=>n.isConnected&&n.dataset.post).length,0);
+  const more=f.container.children.find(n=>n.isConnected&&n.dataset.focusKey==='more-posts');
+  assert.equal(more.style.visibility,'');assert.equal(more.textContent,'+ 1 annonce · voir le fil');
+  element.closest=()=>({querySelectorAll:()=>[hidden]});
+  LocalMap.prototype.renderPins.call(map);
+  assert.equal(f.container.children.filter(n=>n.isConnected&&n.dataset.post).length,1);
+  assert.equal(f.container.children.filter(n=>n.isConnected&&n.dataset.focusKey==='more-posts').length,0);
+  const source=readFileSync(new URL('../public/app.js',import.meta.url),'utf8'),calls=[];
+  const callback=source.match(/onOverflow: (\(\) => \{[^\n]+?\}),onViewChange/)[1];
+  vm.runInNewContext(`(${callback})`,{setView:view=>calls.push(view),$:()=>({focus:()=>calls.push('focus-heading'),scrollIntoView:()=>calls.push('scroll-heading')})})();
+  assert.deepEqual(calls,['feed','focus-heading','scroll-heading']);
 });
 
 test('a detail opener survives several background redraws as an action key rather than a detached DOM node',()=>{
@@ -315,4 +370,96 @@ test('a valid off-page detail can contact and retry, but removed or switched det
   await form.submit(event);assert.equal(calls.length,2);assert.deepEqual(opened,['thread']);
   context.state.detailUnavailable=true;await form.submit(event);assert.equal(calls.length,2);assert.equal(button.disabled,true);
   button.disabled=false;context.state.detailUnavailable=false;context.state.detailId='another';await form.submit(event);assert.equal(calls.length,2);
+});
+
+// Map navigation is tested independently of network tiles. No device location is
+// inferred, and moving the viewport never starts a feed query by itself.
+test('one-finger panning moves the ground under the finger and wraps at the date line',()=>{
+  const size={width:390,height:520},start={center:{lat:48.86,lng:2.35},zoom:12,points:[{x:180,y:200}]};
+  const result=gestureView(start,[{x:260,y:250}],size),before=project(start.center.lat,start.center.lng,12),after=project(result.center.lat,result.center.lng,12);
+  assert.ok(Math.abs(after.x-before.x+80)<1e-7);assert.ok(Math.abs(after.y-before.y+50)<1e-7);assert.equal(result.zoom,12);
+  const wrapped=gestureView({...start,center:{lat:0,lng:179.99}},[{x:-600,y:200}],size);
+  assert.ok(wrapped.center.lng>=-180&&wrapped.center.lng<180);assert.ok(wrapped.center.lng<0);
+});
+test('two-finger pinch preserves the geographic anchor while the midpoint also moves',()=>{
+  const size={width:390,height:520},start={center:{lat:48.86,lng:2.35},zoom:12,points:[{x:120,y:170},{x:220,y:170}]};
+  const result=gestureView(start,[{x:90,y:230},{x:290,y:230}],size);
+  assert.equal(result.zoom,13);
+  const before=project(start.center.lat,start.center.lng,12),after=project(result.center.lat,result.center.lng,13);
+  assert.ok(Math.abs((before.x+170-195)*2-(after.x+190-195))<1e-7);
+  assert.ok(Math.abs((before.y+170-260)*2-(after.y+230-260))<1e-7);
+  const resumed=gestureView({...result,points:[{x:290,y:230}]},[{x:300,y:230}],size);
+  assert.equal(resumed.zoom,13);assert.ok(resumed.center.lng<result.center.lng);
+});
+test('pinch bounds, tiny finger separations and cursor-anchored fractional zoom stay finite',()=>{
+  const size={width:390,height:520},view={center:{lat:48.86,lng:2.35},zoom:12},point={x:100,y:130};
+  const result=zoomViewAt(view,.4,point,size),before=project(view.center.lat,view.center.lng,12),after=project(result.center.lat,result.center.lng,result.zoom),ratio=2**.4;
+  assert.ok(Math.abs((before.x+point.x-195)*ratio-(after.x+point.x-195))<1e-7);
+  assert.equal(zoomViewAt(view,100,point,size).zoom,16);assert.equal(zoomViewAt(view,-100,point,size).zoom,2);
+  const resultTiny=gestureView({...view,points:[point,point]},[point,point],size);
+  assert.equal(resultTiny.zoom,12);assert.ok(Number.isFinite(resultTiny.center.lat));
+});
+function mapInteractionFixture(t){
+  const listeners={},classes=new Set(),captured=new Set(),frames=[];
+  const element={clientWidth:390,clientHeight:520,querySelector:()=>({addEventListener(){}}),
+    classList:{add:name=>classes.add(name),remove:name=>classes.delete(name)},addEventListener(name,fn){listeners[name]=fn;},
+    getBoundingClientRect:()=>({left:0,top:0}),setPointerCapture:id=>captured.add(id),hasPointerCapture:id=>captured.has(id),releasePointerCapture:id=>captured.delete(id)};
+  const oldResize=globalThis.ResizeObserver,oldFrame=globalThis.requestAnimationFrame;
+  globalThis.ResizeObserver=class{observe(){}};globalThis.requestAnimationFrame=fn=>{frames.push(fn);return frames.length;};
+  t.after(()=>{globalThis.ResizeObserver=oldResize;globalThis.requestAnimationFrame=oldFrame;});
+  const map=new LocalMap(element,{pinHTML:()=>'',onSelect(){}});let renders=0;map.render=()=>renders++;
+  const event=(extra={})=>({target:{closest:()=>null},pointerType:'touch',pointerId:1,clientX:100,clientY:100,preventDefault(){this.prevented=true;},...extra});
+  return {map,listeners,event,element,captured,classes,frames,renders:()=>renders};
+}
+test('pointer cancel clears gestures and animation-frame batching bounds rendering',t=>{
+  const f=mapInteractionFixture(t);f.listeners.pointerdown(f.event());
+  f.listeners.pointermove(f.event({clientX:110}));f.listeners.pointermove(f.event({clientX:120}));
+  assert.equal(f.frames.length,1);assert.equal(f.renders(),0);f.frames.shift()();assert.equal(f.renders(),1);
+  f.listeners.pointercancel(f.event());assert.equal(f.captured.size,0);assert.equal(f.classes.has('dragging'),false);
+  const center={...f.map.center};f.listeners.pointermove(f.event({clientX:220}));assert.deepEqual(f.map.center,center);
+});
+test('ordinary wheel and right click are untouched; Ctrl-wheel and keyboard Home act only on the map',t=>{
+  const f=mapInteractionFixture(t),plain=f.event({deltaY:50,ctrlKey:false});f.listeners.wheel(plain);assert.equal(plain.prevented,undefined);
+  f.listeners.pointerdown(f.event({pointerType:'mouse',button:2}));assert.equal(f.captured.size,0);
+  f.listeners.pointerdown(f.event({target:{closest:()=>({})}}));assert.equal(f.captured.size,0);
+  const pinch=f.event({deltaY:-20,ctrlKey:true});f.listeners.wheel(pinch);assert.equal(pinch.prevented,true);assert.ok(f.map.zoom>12);
+  const before={...f.map.center};f.listeners.keydown(f.event({key:'ArrowRight'}));assert.deepEqual(f.map.center,before);
+  f.listeners.keydown(f.event({key:'ArrowRight',target:f.element}));assert.ok(f.map.center.lng>before.lng);
+  f.listeners.keydown(f.event({key:'Home',target:f.element}));assert.deepEqual(f.map.center,f.map.home);assert.equal(f.map.zoom,f.map.homeZoom);
+});
+function appearanceFixture(storage){
+  const choices=['notice','sage','paper'].map(value=>({dataset:{appearance:value},attrs:{},setAttribute(k,v){this.attrs[k]=v;},addEventListener(_,fn){this.click=fn;}}));
+  const listeners={},meta={},root={dataset:{appearance:'notice'},attrs:{},setAttribute(k,v){this.attrs[k]=v;},addEventListener(_,fn){this.click=fn;}},summary={focus(){this.focused=true;}},menu={open:false,contains:()=>false,querySelector:()=>summary};
+  // The real document root also carries data-appearance, but is not a choice.
+  const document={documentElement:root,querySelectorAll:s=>s==='[data-appearance]'?[root,...choices]:s==='#appearance-menu button[data-appearance]'?choices:[],querySelector:s=>s==='meta[name="theme-color"]'?{setAttribute:(k,v)=>meta[k]=v}:menu,addEventListener:(name,fn)=>{listeners[name]=fn;}};
+  const api=createAppearance({document,storage});return {choices,root,meta,menu,summary,listeners,api};
+}
+test('appearance restores only known palettes, persists a non-personal choice, and survives unavailable storage',()=>{
+  const writes=[],f=appearanceFixture({getItem:()=> 'sage',setItem:(...args)=>writes.push(args)});
+  assert.equal(f.root.dataset.appearance,'sage');assert.equal(f.meta.content,'#edf3ee');assert.equal(f.choices[1].attrs['aria-pressed'],'true');
+  assert.equal(f.root.attrs['aria-pressed'],undefined);assert.equal(f.root.click,undefined);
+  f.menu.open=true;f.listeners.pointerdown({target:{}});f.root.click?.();assert.deepEqual(writes,[]);
+  f.choices[2].click();assert.equal(f.root.dataset.appearance,'paper');assert.deepEqual(writes,[['thesocialextra:appearance:v1','paper']]);
+  assert.equal(f.api.apply('__proto__'),'notice');assert.equal(f.api.apply('unknown'),'notice');
+  assert.equal(appearanceFixture({getItem:()=> 'coral'}).root.dataset.appearance,'notice');
+  const privateMode=appearanceFixture({getItem(){throw Error('blocked');},setItem(){throw Error('blocked');}});privateMode.choices[1].click();assert.equal(privateMode.root.dataset.appearance,'sage');
+  f.menu.open=true;f.listeners.keydown({key:'Escape'});assert.equal(f.menu.open,false);assert.equal(f.summary.focused,true);
+});
+function areaSearchFixture(){
+  const nodes=new Map(),calls=[],selections=[],notices=[];
+  const $=id=>{if(!nodes.has(id))nodes.set(id,{disabled:false,textContent:'',focus(){this.focused=true;}});return nodes.get(id);};
+  const context=vm.createContext({$,state:{production:true},mapAreaRequest:0,map:{center:{lat:48.856643,lng:2.352222}},document:{activeElement:null},
+    api:url=>new Promise((resolve,reject)=>calls.push({url,resolve,reject})),setCity:(city,point)=>selections.push({city,point}),toast:text=>notices.push(text),errorText:()=> 'Connexion impossible. Réessayez.'});
+  const start=appSource.indexOf('async function searchMapArea()');vm.runInContext(appSource.slice(start,appSource.indexOf("$('#search-map-area').addEventListener",start)),context);
+  return {context,calls,selections,notices,$};
+}
+test('area search is explicit, rounds coordinates before sending and discards a stale pan result',async()=>{
+  const f=areaSearchFixture();assert.equal(f.calls.length,0);const result=f.context.searchMapArea();
+  assert.equal(f.calls[0].url,'/api/locations/nearest?lat=48.86&lng=2.35');assert.equal(f.$('#search-map-area').disabled,true);
+  f.context.mapAreaRequest++;f.calls[0].resolve({location:{name:'Paris'}});await result;assert.equal(f.selections.length,0);assert.equal(f.notices.length,0);
+  const next=f.context.searchMapArea();f.calls[1].resolve({location:{name:'Paris'}});await next;assert.equal(f.selections.length,1);assert.equal(f.selections[0].point.lat,48.86);
+});
+test('area lookup failure keeps the current city/feed and leaves a retryable visible explanation',async()=>{
+  const f=areaSearchFixture(),result=f.context.searchMapArea();f.calls[0].reject(Object.assign(Error(),{code:'no_nearby_location'}));await result;
+  assert.equal(f.selections.length,0);assert.equal(f.$('#search-map-area').disabled,false);assert.match(f.$('#map-search-status').textContent,/Pas de ville proche/);
 });

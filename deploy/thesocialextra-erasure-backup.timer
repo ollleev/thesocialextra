@@ -1,0 +1,11 @@
+[Unit]
+Description=Fresh thesocialextra erasure journal every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00 UTC
+RandomizedDelaySec=20s
+Persistent=true
+Unit=thesocialextra-erasure-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -18,6 +18,7 @@ import {backupKey,encryptBackup,decryptBackup} from '../ops/backup-crypto.mjs';
 import {AuthService} from '../auth.mjs';
 import {ProductionStore} from '../production-store.mjs';
 import {PresentationStore} from '../presentation-store.mjs';
+import {ErasureJournal,initializeErasureJournal} from '../erasure-journal.mjs';
 
 const AGREEMENT={acceptedRules:true,rulesVersion:RULES.version};
 
@@ -25,6 +26,10 @@ const PASSWORD='synthetic password sufficiently long';
 const testKdf=async(password,salt)=>createHash('sha512').update(password).update(salt).digest();
 const input=(extra={})=>({kind:'need',role:'Barman',cityId:'2988507',english:false,vehicle:false,durationMinutes:30,places:2,note:'Synthétique.',...extra});
 const key=()=>randomUUID();
+const eventPlanInput=()=>({id:key(),title:'Événement synthétique',cityId:'2988507',timezone:'Europe/Paris',venue:'Salle de réception',
+  startLocal:'2026-08-29T17:00',endLocal:'2026-08-29T23:00',common:{attire:'Tenue noire',equipment:'',arrival:'Entrée principale'},
+  needs:[{id:key(),role:'Serveur',quantity:3,confirmed:1,languages:{fr:'required',en:'preferred'},skills:'Service au plateau',
+    overrides:{attire:null,equipment:'',arrival:null}}]});
 // Processor boundary stub, never claimed as decodable media. Real decoder
 // fixtures are covered separately in image/video-processing tests.
 const presentationPhoto=()=>({bytes:Buffer.from([255,216,1,2,3,4,255,217]),contentType:'image/jpeg',width:20,height:10});
@@ -89,7 +94,7 @@ test('cookie-only sessions expose no tokens, validate strictly, and enforce orig
   assert.match(r.headers['set-cookie'][0],/^__Host-extra_session=[a-f0-9]{64}; Path=\/; HttpOnly; SameSite=Lax; Max-Age=2592000; Secure$/);
   assert.equal(r.headers['strict-transport-security'],'max-age=31536000');
   const session=await f.request('/api/session',{cookie:r.cookie});
-  assert.deepEqual(session.data,{mode:'production',user:r.data.user,ownership:[],moderator:false,rules:{...RULES,accepted:true}});
+  assert.deepEqual(session.data,{mode:'production',user:r.data.user,ownership:[],moderator:false,rules:{...RULES,accepted:true},features:{eventPlans:true}});
   const token=r.cookie.split('=')[1];
   assert.equal((await f.request('/api/session',{headers:{'X-Owner-Token':token,Authorization:`Bearer ${token}`}})).data.user,null);
   for(const cookie of [`${r.cookie}; ${r.cookie}`,`${r.cookie}x`,'broken',`${r.cookie}; __Host-extra_session=anything`])assert.equal((await f.request('/api/session',{cookie})).status,400);
@@ -358,12 +363,12 @@ test('moderation routes enforce moderator identity and removal',async t=>{
 });
 
 test('a slow request cannot mutate after its session is revoked during body upload',async t=>{
-  for(const operation of ['create','block','acceptance']) {
-  const f=await fixture(t),owner=await f.register('slow_owner'),payload=JSON.stringify(operation==='create'?input():operation==='acceptance'?AGREEMENT:{});
+  for(const operation of ['create','block','acceptance','event-plan']) {
+  const f=await fixture(t),owner=await f.register('slow_owner'),payload=JSON.stringify(operation==='event-plan'?eventPlanInput():operation==='create'?input():operation==='acceptance'?AGREEMENT:{});
   if(operation==='acceptance')f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(owner.data.user.id);
   const target=operation==='block'?await f.register('synthetic_target'):null;
   const post=target?f.app.store.create(target.data.user.id,input(),key()).post:null;
-  const route=post?`/api/posts/${post.id}/block`:operation==='acceptance'?'/api/account/rules-acceptance':'/api/posts';
+  const route=post?`/api/posts/${post.id}/block`:operation==='acceptance'?'/api/account/rules-acceptance':operation==='event-plan'?'/api/event-plans':'/api/posts';
   let pending;
   const accepted=new Promise(resolve=>f.app.server.once('request',resolve));
   const response=new Promise((resolve,reject)=>{
@@ -373,6 +378,7 @@ test('a slow request cannot mutate after its session is revoked during body uplo
   await f.request('/api/auth/logout',{method:'POST',cookie:owner.cookie,body:{}});
   pending.end(payload.slice(1));assert.equal(await response,401);assert.equal(f.app.store.state().posts.length,post?1:0);
   assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_blocks').get().n,0);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_event_plans').get().n,0);
   if(operation==='acceptance')assert.equal(f.app.auth.hasAcceptedRules(owner.data.user.id),false);
   }
 });
@@ -414,7 +420,7 @@ async function voiceFixture(t,options={}) {
 
 test('voice is disabled without an operator socket and cannot be switched on through request data',async t=>{
   const f=await fixture(t),user=await f.register('voice_disabled');
-  assert.equal((await f.request('/api/session')).data.features,undefined);
+  assert.deepEqual((await f.request('/api/session')).data.features,{eventPlans:true});
   const r=await f.request('/api/threads/unknown/voice',{method:'POST',cookie:user.cookie,rawBody:'synthetic',headers:{'Content-Type':'audio/webm','Idempotency-Key':key(),'X-Voice-Socket':'/tmp/attacker.sock'}});
   assert.equal(r.status,404);assert.match(r.headers['permissions-policy'],/microphone=\(\)/);
 });
@@ -581,7 +587,7 @@ async function presentationFixture(t,options={}) {
 
 test('presentation feature is absent by default and requires an operator socket, not a client flag',async t=>{
  const f=await fixture(t),owner=await f.register('presentation_disabled');
- assert.equal((await f.request('/api/session')).data.features,undefined);
+ assert.deepEqual((await f.request('/api/session')).data.features,{eventPlans:true});
  for(const method of ['GET','PUT','DELETE'])assert.equal((await f.request('/api/presentation',{method,cookie:owner.cookie,headers:{'X-Presentation-Socket':'/tmp/untrusted'}})).status,404);
  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name='app_presentations'").get().n,0);
 });
@@ -697,4 +703,176 @@ test('real photo/video cross HTTP and the Unix worker, then encrypted backup res
   for(const table of ['app_presentations','app_presentation_assets','app_presentation_intents','app_report_presentations','app_report_presentation_assets'])assert.equal(restored.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n,0);
   assert.equal(restored.prepare('PRAGMA integrity_check').get().integrity_check,'ok');
  }finally{restored.close();}
+});
+
+async function journalFixture(t,options={}) {
+ const dir=await mkdtemp(path.join(tmpdir(),'social-http-erasure-')),databasePath=path.join(dir,'app.sqlite'),journalFile=path.join(dir,'journal.sqlite');
+ const bootstrap=openDatabase(databasePath);
+ try{new AuthService({db:bootstrap,testKdf});new ProductionStore({db:bootstrap});initializeErasureJournal({db:bootstrap,filename:journalFile});}finally{bootstrap.close();}
+ const journal=new ErasureJournal(journalFile);
+ const f=await fixture(t,{databasePath,erasureJournal:journal,...options});
+ t.after(async()=>{journal.close();await rm(dir,{recursive:true,force:true});});
+ return {...f,journal,journalFile};
+}
+
+test('HTTP account deletion records the independent intent before acknowledging the app checkpoint',async t=>{
+ const f=await journalFixture(t),owner=await f.register('journal_http_owner');
+ await f.request('/api/posts',{method:'POST',cookie:owner.cookie,body:input(),headers:{'Idempotency-Key':key()}});
+ const result=await f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}});
+ assert.equal(result.status,204);assert.equal(f.journal.tip().seq,1);
+ const checkpoint=f.db.prepare('SELECT seq,hash FROM app_erasure_checkpoint').get();
+ assert.equal(checkpoint.seq,1);assert.equal(checkpoint.hash,f.journal.tip().hash);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,0);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_posts').get().n,0);
+ assert.throws(()=>createProductionServer({db:f.db,publicOrigin:'https://extras.test',authOptions:{testKdf}}),/erasure_journal_required/);
+});
+
+test('an app failure after durable erasure intent closes feeds and APIs, then startup replays before listening',async t=>{
+ const f=await journalFixture(t),owner=await f.register('pending_erasure_owner');
+ await f.request('/api/posts',{method:'POST',cookie:owner.cookie,body:input(),headers:{'Idempotency-Key':key()}});
+ const stream=await f.stream();assert.equal((await stream.next()).event,'state');
+ f.db.exec("CREATE TRIGGER fail_erasure BEFORE DELETE ON auth_users BEGIN SELECT RAISE(ABORT,'synthetic erasure failure'); END;");
+ const failed=await f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}});
+ assert.equal(failed.status,503);assert.equal(failed.data.error,'account_erasure_pending');
+ assert.equal((await stream.next()).event,'unavailable');
+ assert.equal(f.journal.tip().seq,1);assert.equal(f.db.prepare('SELECT seq FROM app_erasure_checkpoint').get().seq,0);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,1);
+ for(const url of ['/api/session','/api/state','/api/roles'])assert.equal((await f.request(url,{cookie:owner.cookie})).status,503);
+ assert.equal((await f.request('/api/auth/register',{method:'POST',body:{username:'forbidden_pending',password:PASSWORD,...AGREEMENT}})).status,503);
+ await f.app.close();f.db.exec('DROP TRIGGER fail_erasure');
+ const restarted=createProductionServer({db:f.db,publicOrigin:'https://extras.test',authOptions:{testKdf},erasureJournal:f.journal});
+ try{assert.equal(restarted.server.listening,false);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,0);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_posts').get().n,0);assert.equal(f.db.prepare('SELECT seq FROM app_erasure_checkpoint').get().seq,1);}
+ finally{await restarted.close();}
+});
+
+test('HTTP KDF already in flight cannot create a new account after the erasure guard closes',async t=>{
+ let release,started;
+ const waiting=new Promise(resolve=>started=resolve);
+ const held='synthetic registration blocked in KDF';
+ const f=await journalFixture(t,{authOptions:{testKdf:async(password,salt)=>{
+  if(password===held){started();await new Promise(resolve=>release=resolve);}return testKdf(password,salt);
+ }}}),owner=await f.register('parallel_erasure_owner');
+ const pending=f.request('/api/auth/register',{method:'POST',body:{username:'parallel_new_user',password:held,...AGREEMENT}});
+ await waiting;
+ try {
+  f.db.exec("CREATE TRIGGER fail_erasure BEFORE DELETE ON auth_users BEGIN SELECT RAISE(ABORT,'synthetic'); END;");
+  assert.equal((await f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}})).status,503);
+ }finally{release();}
+ assert.equal((await pending).status,503);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,1);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_sessions').get().n,1);
+});
+
+test('logout during deletion password verification prevents both the journal intent and erasure',async t=>{
+ let hold=false,release,started;
+ const waiting=new Promise(resolve=>started=resolve);
+ const f=await journalFixture(t,{authOptions:{testKdf:async(password,salt)=>{
+  if(hold){started();await new Promise(resolve=>release=resolve);}return testKdf(password,salt);
+ }}}),owner=await f.register('logout_erasure_owner');hold=true;
+ const pending=f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}});
+ await waiting;
+ try{assert.equal((await f.request('/api/auth/logout',{method:'POST',cookie:owner.cookie,body:{}})).status,200);}finally{release();}
+ assert.equal((await pending).status,401);assert.equal(f.journal.tip().seq,0);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,1);
+});
+
+test('ambiguous journal return and checkpoint failure both preserve the intent and fail closed',async t=>{
+ for(const kind of ['journal-return','checkpoint']) {
+  const f=await journalFixture(t),owner=await f.register('ambiguous_'+kind.replace('-','_'));
+  await f.request('/api/posts',{method:'POST',cookie:owner.cookie,body:input(),headers:{'Idempotency-Key':key()}});
+  const append=f.journal.append.bind(f.journal);
+  if(kind==='journal-return')f.journal.append=(...args)=>{append(...args);throw Error('synthetic after durable commit');};
+  else f.db.exec("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON app_erasure_checkpoint BEGIN SELECT RAISE(ABORT,'synthetic checkpoint failure'); END;");
+  const failed=await f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}});
+  assert.equal(failed.status,503);assert.equal(f.journal.tip().seq,1);
+  assert.equal(f.db.prepare('SELECT seq FROM app_erasure_checkpoint').get().seq,0);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,1);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_posts').get().n,1);
+  assert.equal((await f.request('/api/state')).status,503);
+  await f.app.close();f.journal.append=append;
+  if(kind==='checkpoint')f.db.exec('DROP TRIGGER fail_checkpoint');
+  const restarted=createProductionServer({db:f.db,publicOrigin:'https://extras.test',authOptions:{testKdf},erasureJournal:f.journal});
+  try{assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,0);assert.equal(f.db.prepare('SELECT seq FROM app_erasure_checkpoint').get().seq,1);}finally{await restarted.close();}
+ }
+});
+
+test('a slow HTTP body cannot write after a concurrent erasure failure places the service in maintenance',async t=>{
+ for(const route of ['/api/posts','/api/event-plans']) {
+ const f=await journalFixture(t),owner=await f.register('slow_erasure_owner'),writer=await f.register('slow_erasure_writer');
+ const payload=JSON.stringify(route==='/api/posts'?input():eventPlanInput());let pending;
+ const response=new Promise((resolve,reject)=>{
+  pending=http.request({hostname:'127.0.0.1',port:f.app.server.address().port,path:route,method:'POST',headers:{Host:'extras.test',Origin:'https://extras.test',Cookie:writer.cookie,'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload),'Idempotency-Key':key()}},res=>{res.resume();res.on('end',()=>resolve(res.statusCode));});pending.on('error',reject);pending.write(payload.slice(0,1));
+ });
+ // An ordinary round trip leaves the partial body pending in the same listener.
+ assert.equal((await f.request('/api/session',{cookie:writer.cookie})).status,200);
+ f.db.exec("CREATE TRIGGER fail_erasure BEFORE DELETE ON auth_users BEGIN SELECT RAISE(ABORT,'synthetic'); END;");
+ assert.equal((await f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}})).status,503);
+ pending.end(payload.slice(1));assert.equal(await response,503);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_posts').get().n,0);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_event_plans').get().n,0);
+ }
+});
+
+test('event plan HTTP routes remain private, preserve revisions and do not publish into the live feed',async t=>{
+ const f=await fixture(t,{clock:()=>Date.UTC(2026,7,28)}),owner=await f.register('plan_owner'),other=await f.register('plan_other'),draft=eventPlanInput();
+ const create=()=>f.request('/api/event-plans',{method:'POST',cookie:owner.cookie,body:draft});
+ assert.equal((await f.request('/api/event-plans')).status,401);
+ assert.equal((await f.request('/api/event-plans',{method:'POST',body:draft})).status,401);
+ const first=await create();assert.equal(first.status,201,JSON.stringify(first.data));
+ assert.equal(first.headers['cache-control'],'no-store');assert.equal(first.data.plan.visibility,'private');
+ assert.deepEqual(first.data.plan.totals,{quantity:3,confirmed:1,remaining:2});
+ const replay=await create();assert.equal(replay.status,200);assert.equal(replay.data.replayed,true);
+ const url=`/api/event-plans/${draft.id}`,{id,...values}=draft;
+ assert.deepEqual((await f.request('/api/event-plans',{cookie:other.cookie})).data,{plans:[]});
+ for(const method of ['GET','PATCH','DELETE']) {
+  const r=await f.request(url,{method,cookie:other.cookie,...(method==='PATCH'?{body:{expectedRevision:1,...values}}:method==='DELETE'?{body:{expectedRevision:1}}:{})});
+  assert.equal(r.status,404,JSON.stringify(r.data));
+ }
+ const update=await f.request(url,{method:'PATCH',cookie:owner.cookie,body:{expectedRevision:1,...values,needs:[{...draft.needs[0],confirmed:3}]}});
+ assert.equal(update.status,200);assert.equal(update.data.plan.revision,2);assert.equal(update.data.plan.totals.remaining,0);
+ assert.equal((await f.request(url,{method:'PATCH',cookie:owner.cookie,body:{expectedRevision:1,...values}})).status,409);
+ assert.equal((await f.request(url+'?owner=anything',{cookie:owner.cookie})).status,400);
+ assert.equal((await f.request(url,{method:'POST',cookie:owner.cookie,body:{}})).status,405);
+ assert.equal((await f.request('/api/state')).data.posts.length,0);
+ assert.equal((await f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}})).status,204);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_event_plans').get().n,0);
+});
+
+test('event plan rules guard applies to saves, never to reading or erasing, and deletion cannot be replayed into creation',async t=>{
+ const f=await fixture(t,{clock:()=>Date.UTC(2026,7,28)}),owner=await f.register('plan_rules'),draft=eventPlanInput(),cookie=owner.cookie;
+ assert.equal((await f.request('/api/event-plans',{method:'POST',cookie,body:draft})).status,201);
+ const url=`/api/event-plans/${draft.id}`,{id,...values}=draft;
+ f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(owner.data.user.id);
+ for(const [route,method,body] of [['/api/event-plans','POST',eventPlanInput()],[url,'PATCH',{expectedRevision:1,...values}]]) {
+  const denied=await f.request(route,{method,cookie,body});assert.equal(denied.status,403);assert.equal(denied.data.error,'rules_acceptance_required');
+ }
+ assert.equal((await f.request(url,{cookie})).status,200);
+ assert.equal((await f.request(url,{method:'DELETE',cookie,body:{expectedRevision:1}})).status,200);
+ assert.equal((await f.request(url,{method:'DELETE',cookie,body:{expectedRevision:1}})).status,200);
+ assert.deepEqual((await f.request('/api/event-plans',{cookie})).data,{plans:[]});
+ await f.request('/api/account/rules-acceptance',{method:'POST',cookie,body:AGREEMENT});
+ assert.equal((await f.request('/api/event-plans',{method:'POST',cookie,body:draft})).status,410);
+ assert.equal(f.db.prepare('SELECT data FROM app_event_plans').get().data,null);
+});
+
+test('only structured event saves accept the bounded 64 KiB envelope; normal routes retain 8 KiB',async t=>{
+ const f=await fixture(t,{clock:()=>Date.UTC(2026,7,28)}),owner=await f.register('plan_bytes'),draft=eventPlanInput(),cookie=owner.cookie;
+ draft.needs=Array.from({length:12},()=>({...draft.needs[0],id:key(),skills:'é'.repeat(180),overrides:{attire:'é'.repeat(120),equipment:'é'.repeat(120),arrival:'é'.repeat(120)}}));
+ const bytes=Buffer.byteLength(JSON.stringify(draft));assert.ok(bytes>8192&&bytes<32768);
+ assert.equal((await f.request('/api/event-plans',{method:'POST',cookie,body:draft})).status,201);
+ assert.equal((await f.request('/api/event-plans',{method:'POST',cookie,rawBody:JSON.stringify(draft)+' '.repeat(65536)})).status,413);
+ assert.equal((await f.request('/api/auth/logout',{method:'POST',cookie,rawBody:'{}'+' '.repeat(8192)})).status,413);
+ const {id,...values}=draft;
+ assert.equal((await f.request(`/api/event-plans/${id}`,{method:'PATCH',cookie,body:{expectedRevision:1,...values}})).status,200);
+});
+
+test('event plan save rechecks rules after a partial request body',async t=>{
+ const f=await fixture(t,{clock:()=>Date.UTC(2026,7,28)}),owner=await f.register('plan_slow_rules'),payload=JSON.stringify(eventPlanInput());let pending;
+ const accepted=new Promise(resolve=>f.app.server.once('request',resolve));
+ const response=new Promise((resolve,reject)=>{
+  pending=http.request({hostname:'127.0.0.1',port:f.app.server.address().port,path:'/api/event-plans',method:'POST',headers:{Host:'extras.test',Origin:'https://extras.test',Cookie:owner.cookie,'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}},res=>{res.resume();res.on('end',()=>resolve(res.statusCode));});pending.on('error',reject);pending.write(payload.slice(0,1));
+ });
+ await accepted;f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(owner.data.user.id);
+ pending.end(payload.slice(1));assert.equal(await response,403);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_event_plans').get().n,0);
 });

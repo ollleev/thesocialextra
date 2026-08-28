@@ -29,6 +29,7 @@ Ouvrir ensuite l’adresse locale 4179. HTTP est autorisé uniquement en mode lo
 - Consultation libre ; pseudo et phrase secrète pour publier et échanger. Code de secours, sessions révocables et suppression de compte accessible depuis le web.
 - Annonces visibles 30 min, 1 h, 2 h ou 4 h. Places confirmées manuellement ; un message ne réserve rien. Les annonces pourvues quittent le fil.
 - Douze métiers, carte et fil, recherche par ville et localisation approximative facultative. Catalogue GeoNames de grandes localités, non exhaustif.
+- Préparation privée d’événements : horaires, besoins par métier, langues, consignes et confirmations manuelles. Après enregistrement, chaque besoin peut devenir une annonce indépendante, relue avant publication ; les consignes privées ne sont pas copiées. Les dates de mission et la durée de visibilité de l’annonce restent distinctes.
 - Accord versionné aux règles de publication, vérifié côté serveur avant les nouvelles contributions ; lecture, sécurité et suppression restent accessibles. Le document fourni est un pilote à remplacer par une nouvelle version validée avant ouverture.
 - Blocage depuis une annonce sans contact préalable, masquage du fil et de la carte pour le compte connecté, gestion des blocages même après expiration du contenu.
 - Conversations privées, messages texte et vocaux facultatifs, blocage et signalements. Conservation jusqu’à sept jours après expiration publique, sauf suppression ou modération.
@@ -40,7 +41,7 @@ Les identités, autorisations de travail et compétences ne sont pas vérifiées
 
 ## Exploiter et contribuer
 
-[Déploiement et limites](DEPLOYMENT.md) · [Sécurité](SECURITY.md) · [Ressources tierces](THIRD-PARTY-NOTICES.md).
+[Déploiement et limites](DEPLOYMENT.md) · [Sauvegardes](BACKUP.md) · [Effacement et restauration](ERASURE.md) · [Sécurité](SECURITY.md) · [Ressources tierces](THIRD-PARTY-NOTICES.md).
 
 Proposez des changements limités, accompagnés de tests du comportement modifié. N’ajoutez jamais de données personnelles, secrets, bases de production ou captures privées aux issues et pull requests. Les tests utilisent des fixtures synthétiques. `CI-example.yml` fournit un exemple GitHub Actions, mais aucun workflow automatique n’est activé dans ce dépôt à sa publication : le jeton de publication n’a pas le droit de créer des workflows. Les tests ont été exécutés localement ; aucun résultat CI distant n’est revendiqué.
 

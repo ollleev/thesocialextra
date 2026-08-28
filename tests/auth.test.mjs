@@ -89,12 +89,33 @@ test('unknown usernames and wrong passwords perform the same KDF and return gene
   const { service } = fixture(t, { testKdf: (password, salt, config) => { calls.push({ saltLength: salt.length, config }); return fastKdf(password, salt); } });
   await service.register({ ...AGREEMENT, username: 'worker_03', password: PASSWORD });
   calls.length = 0;
-  await assert.rejects(service.login({ username: 'worker_03', password: NEW_PASSWORD }), error(401, 'invalid_credentials'));
-  await assert.rejects(service.login({ username: 'nonexistent_03', password: NEW_PASSWORD }), error(401, 'invalid_credentials'));
-  assert.equal(calls.length, 2);
+  for (const method of ['login', 'verifyPassword']) {
+    await assert.rejects(service[method]({ username: 'worker_03', password: NEW_PASSWORD }), error(401, 'invalid_credentials'));
+    await assert.rejects(service[method]({ username: 'nonexistent_03', password: NEW_PASSWORD }), error(401, 'invalid_credentials'));
+  }
+  assert.equal(calls.length, 4);
   assert.equal(calls[0].saltLength, 16);
-  assert.deepEqual(calls[0], calls[1]);
+  for (const call of calls) assert.deepEqual(call, calls[0]);
   for (const value of [undefined, null, '', 'not-a-token', 'a'.repeat(64), {}, '0'.repeat(1000)]) assert.equal(service.session(value), null);
+});
+
+test('password verification is read-only at capacity and does not create, prune or revoke sessions', async t => {
+  const { db, service } = fixture(t, { maxUsers: 1 });
+  const registered = await service.register({ ...AGREEMENT, username: 'verify_readonly', password: PASSWORD });
+  for (let i = 0; i < 4; i++) await service.login({ username: 'verify_readonly', password: PASSWORD });
+  db.prepare('UPDATE auth_sessions SET expires_at=0 WHERE token_hash=?').run(hash(registered.sessionToken));
+  db.exec('CREATE TABLE synthetic_full(bytes BLOB) STRICT');
+  const pages = db.prepare('PRAGMA page_count').get().page_count;
+  db.exec(`PRAGMA max_page_count=${pages + 1}`);
+  assert.throws(() => db.prepare('INSERT INTO synthetic_full VALUES(?)').run(Buffer.alloc(1024 ** 2)), e => e.errcode === 13);
+  const before = db.prepare('SELECT * FROM auth_sessions ORDER BY token_hash').all();
+  const changes = db.prepare('SELECT total_changes() AS n').get().n;
+  db.exec('PRAGMA query_only=ON');
+  assert.deepEqual(await service.verifyPassword({ username: 'VERIFY_READONLY', password: PASSWORD }), registered.user);
+  assert.deepEqual(await service.verifyPassword({ username: 'verify_readonly', password: PASSWORD }), registered.user);
+  assert.deepEqual(db.prepare('SELECT * FROM auth_sessions ORDER BY token_hash').all(), before);
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes);
+  assert.equal(db.isTransaction, false);
 });
 
 test('sessions expire at 30 days, logout revokes them, and only the five newest survive', async t => {
@@ -157,18 +178,73 @@ test('two concurrent recoveries cannot consume the same code twice', async t => 
   assert.deepEqual(service.session(winner.sessionToken), registered.user);
 });
 
-test('a password login awaiting KDF cannot recreate a session after recovery', async t => {
+test('login and password verification awaiting KDF reject credentials replaced by recovery', async t => {
+  for (const method of ['login', 'verifyPassword']) {
+    const control = controlledKdf();
+    const { service } = fixture(t, { testKdf: control.kdf });
+    const registered = await service.register({ ...AGREEMENT, username: 'worker_07', password: PASSWORD });
+    control.block();
+    const pending = service[method]({ username: 'worker_07', password: PASSWORD });
+    const recovery = service.recover({ recoveryCode: registered.recoveryCode, password: NEW_PASSWORD });
+    control.pending[1]();
+    const recovered = await recovery;
+    control.pending[0]();
+    await assert.rejects(pending, error(401, 'invalid_credentials'));
+    assert.deepEqual(service.session(recovered.sessionToken), registered.user);
+  }
+});
+
+test('password verification awaiting KDF rejects a deleted account without creating any session', async t => {
   const control = controlledKdf();
-  const { service } = fixture(t, { testKdf: control.kdf });
-  const registered = await service.register({ ...AGREEMENT, username: 'worker_07', password: PASSWORD });
+  const { db, service } = fixture(t, { testKdf: control.kdf });
+  const registered = await service.register({ ...AGREEMENT, username: 'verify_deleted', password: PASSWORD });
   control.block();
-  const login = service.login({ username: 'worker_07', password: PASSWORD });
-  const recovery = service.recover({ recoveryCode: registered.recoveryCode, password: NEW_PASSWORD });
-  control.pending[1]();
-  const recovered = await recovery;
+  const pending = service.verifyPassword({ username: 'verify_deleted', password: PASSWORD });
+  service.deleteAccount(registered.user.id);
+  const changes = db.prepare('SELECT total_changes() AS n').get().n;
   control.pending[0]();
-  await assert.rejects(login, error(401, 'invalid_credentials'));
-  assert.deepEqual(service.session(recovered.sessionToken), registered.user);
+  await assert.rejects(pending, error(401, 'invalid_credentials'));
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auth_sessions').get().n, 0);
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes);
+});
+
+test('maintenance acquired during KDF stops register, login and recovery before any mutation', async t => {
+  for (const action of ['register', 'login', 'recover']) {
+    const control = controlledKdf(), denied = new ApiError(503, 'synthetic_maintenance');
+    let maintenance = false;
+    const { db, service } = fixture(t, { testKdf: control.kdf, beforeMutation: () => { if (maintenance) throw denied; } });
+    const registered = await service.register({ ...AGREEMENT, username: 'maintenance_owner', password: PASSWORD });
+    const snapshot = () => ['auth_users', 'auth_sessions', 'auth_rule_acceptances'].map(table => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+    const before = snapshot(), changes = db.prepare('SELECT total_changes() AS n').get().n;
+    control.block();
+    const input = action === 'register' ? { ...AGREEMENT, username: 'maintenance_other', password: PASSWORD }
+      : action === 'login' ? { username: 'maintenance_owner', password: PASSWORD }
+        : { recoveryCode: registered.recoveryCode, password: NEW_PASSWORD };
+    const pending = service[action](input);
+    assert.equal(control.pending.length, 1);
+    maintenance = true; control.pending[0]();
+    await assert.rejects(pending, e => e === denied);
+    assert.deepEqual(snapshot(), before);
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes);
+    assert.equal(db.isTransaction, false);
+    assert.deepEqual(service.session(registered.sessionToken), registered.user);
+  }
+});
+
+test('maintenance gates logout, but password verification stays read-only and returns no session capability', async t => {
+  const denied = new ApiError(503, 'synthetic_maintenance');
+  let maintenance = false;
+  const { db, service } = fixture(t, { beforeMutation: () => { if (maintenance) throw denied; } });
+  assert.throws(() => new AuthService({ db, beforeMutation: null }), /beforeMutation must be a function/);
+  const registered = await service.register({ ...AGREEMENT, username: 'maintenance_readonly', password: PASSWORD });
+  maintenance = true;
+  const changes = db.prepare('SELECT total_changes() AS n').get().n;
+  assert.throws(() => service.logout(registered.sessionToken), e => e === denied);
+  assert.deepEqual(await service.verifyPassword({ username: 'maintenance_readonly', password: PASSWORD }), registered.user);
+  assert.deepEqual(service.session(registered.sessionToken), registered.user);
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes);
+  maintenance = false; service.logout(registered.sessionToken);
+  assert.equal(service.session(registered.sessionToken), null);
 });
 
 test('the process-wide KDF gate rejects a third calculation and releases slots afterward', async t => {
@@ -292,6 +368,7 @@ test('production scrypt really registers and verifies at N=131072 r=8 p=1 withou
   const login = await service.login({ username: 'REAL_KDF_TEST', password: PASSWORD });
   assert.deepEqual(login.user, registered.user);
   assert.deepEqual(service.session(login.sessionToken), registered.user);
+  assert.deepEqual(await service.verifyPassword({ username: 'REAL_KDF_TEST', password: PASSWORD }), registered.user);
 });
 
 test('the validated user cap rejects new registrations before KDF but keeps login and recovery available', async t => {

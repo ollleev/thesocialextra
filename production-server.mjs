@@ -15,6 +15,8 @@ import { RULE_DOCUMENTS, rulesDocument } from './rules.mjs';
 import { PresentationStore } from './presentation-store.mjs';
 import { readPresentationBody, sendPresentation } from './presentation-http.mjs';
 import { presentationViaWorker } from './presentation-worker.mjs';
+import { ErasureJournal, acknowledgeErasure, reconcileErasures } from './erasure-journal.mjs';
+import { EventPlanStore } from './event-plans.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MUTATING = new Set(['POST', 'PATCH', 'DELETE', 'PUT']);
@@ -39,16 +41,16 @@ function securityHeaders(res, secure, voiceEnabled) {
   if (secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
 }
 function json(res, status, data) { res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); }
-async function body(req) {
+async function body(req, maxBytes = 8192) {
   if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) fail(415,'json_required');
   if (req.headers['content-encoding'] && req.headers['content-encoding'] !== 'identity') fail(415,'unsupported_encoding');
-  if (Number(req.headers['content-length']) > 8192) fail(413,'body_too_large');
+  if (Number(req.headers['content-length']) > maxBytes) fail(413,'body_too_large');
   const chunks=[]; let length=0;
   // Do not destroy the request iterator on rejection: allow the error response,
   // then close this connection without buffering the remaining body.
   for await (const chunk of req.iterator({ destroyOnReturn:false })) {
     length+=chunk.length;
-    if(length>8192) fail(413,'body_too_large');
+    if(length>maxBytes) fail(413,'body_too_large');
     chunks.push(chunk);
   }
   let value; try { value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks))); } catch { fail(400,'invalid_json'); }
@@ -90,13 +92,18 @@ function scopeFrom(params) {
 /** HTTPS terminates at the configured reverse proxy; never expose this listener directly. */
 export function createProductionServer({ db, publicOrigin, publicDir=path.join(HERE,'public'), clock=Date.now,
   authOptions={}, moderators=[], allowLocalHttp=false, trustedProxyAddresses=[], voiceSocketPath=null, testVoiceProcessor,
-  presentationSocketPath=null,testPresentationProcessor,
+  presentationSocketPath=null,testPresentationProcessor,erasureJournal=null,
   rateLimit=240, mutationRateLimit=60, accountRateLimit=120, authRateLimit=15, authAccountRateLimit=10,
   rateWindowMs=60_000, authWindowMs=15*60_000, rateMaxEntries=10000,
   maxBlocksPerUser=500, maxTotalBlocks=100000,
   maxStreams=256, maxStreamsPerIp=8, sweepIntervalMs=1000, heartbeatIntervalMs=15_000 }={}) {
   const {url:origin,secure}=configuredOrigin(publicOrigin,allowLocalHttp);
   if(authOptions.testRules!==undefined)throw new TypeError('The HTTP server always uses the verified rules document');
+  if(authOptions.beforeMutation!==undefined)throw new TypeError('The server owns the mutation safety guard');
+  if(erasureJournal!==null&&(!(erasureJournal instanceof ErasureJournal)||erasureJournal.readOnly))throw new TypeError('An opened writable erasure journal is required');
+  if(!erasureJournal&&db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_erasure_checkpoint'").get())throw new Error('erasure_journal_required');
+  let erasureFault=false;
+  function requireHealthy(){if(erasureFault)fail(503,'account_erasure_pending');}
   const verifiedRulesDocuments=new Map(RULE_DOCUMENTS.map(rule=>[rule.url,rulesDocument(rule.version)]));
   if(voiceSocketPath!==null && (typeof voiceSocketPath!=='string'||!path.isAbsolute(voiceSocketPath)||voiceSocketPath.length>100||/[\0\r\n]/.test(voiceSocketPath))) throw new TypeError('A trusted absolute voice socket is required');
   if(testVoiceProcessor!==undefined && (!process.env.NODE_TEST_CONTEXT || typeof testVoiceProcessor!=='function')) throw new TypeError('Voice injection is for the native test runner only');
@@ -110,8 +117,10 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     if(!Number.isSafeInteger(value)||value<1) throw new TypeError('Limits and intervals must be positive integers');
   const trusted=new Set(trustedProxyAddresses.map(normalizeIp));
   if([...trusted].some(ip=>!isIP(ip))) throw new TypeError('Trusted proxies must be exact IP addresses');
-  const auth=new AuthService({...authOptions,db,clock}), store=new ProductionStore({db,clock,moderators,maxBlocksPerUser,maxTotalBlocks,hasAcceptedRules:userId=>auth.hasAcceptedRules(userId)});
+  const auth=new AuthService({...authOptions,db,clock,beforeMutation:requireHealthy}), store=new ProductionStore({db,clock,moderators,maxBlocksPerUser,maxTotalBlocks,hasAcceptedRules:userId=>auth.hasAcceptedRules(userId)});
   const presentations=presentationSocketPath?new PresentationStore({db,store,clock}):null;
+  const eventPlans=new EventPlanStore({db,clock,beforeMutation:requireHealthy});
+  if(erasureJournal)reconcileErasures({db,store,auth,journal:erasureJournal});
   const moderatorIds=new Set(moderators), cookieName=secure?'__Host-extra_session':'extra_session';
   const staticRoot=path.resolve(publicDir), rates=new Map(), streams=new Set();
   let disposed=false, scheduled=false, broadcasting=false, privateScheduled=false;
@@ -151,6 +160,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     try{return sendPresentation(req,res,read());}catch(error){release();throw error;}
   }
   function validStream(stream) {
+    if(erasureFault){stream.res.end('event: unavailable\ndata: {}\n\n');streams.delete(stream);return false;}
     if(stream.res.destroyed||stream.res.writableEnded) { streams.delete(stream);return false; }
     if(stream.res.writableLength>256*1024) { streams.delete(stream);stream.res.destroy();return false; }
     let current;try{current=stream.userId?auth.session(stream.token):null;}catch{stream.res.end('event: unavailable\ndata: {}\n\n');streams.delete(stream);return false;}
@@ -163,6 +173,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     // Both the reader and serialized frames die with this synchronous batch.
     // Sharing never crosses an account or a scope, including mine and point.
     targets=[...targets];if(!targets.length)return;
+    if(erasureFault){failStreams();return;}
     let readSnapshot;
     try { readSnapshot=store.snapshotReader(); }
     catch { for(const stream of targets){stream.res.end('event: unavailable\ndata: {}\n\n');streams.delete(stream);}return; }
@@ -222,12 +233,31 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       const ip=clientIp(req);rate(`ip:${ip}`,rateLimit);
       if(MUTATING.has(req.method)) rate(`mutation:${ip}`,mutationRateLimit);
       const {pathname,searchParams}=new URL(req.url,publicOrigin);
+      if(pathname.startsWith('/api/'))requireHealthy();
       const token=cookieToken(req,cookieName),user=auth.session(token);
       // Recheck after awaiting a body: logout/recovery/expiry may have happened
       // while a slow request was uploading. Never authorize writes from stale user data.
-      const currentUserId=()=>requireUser(auth.session(token));
+      const currentUserId=()=>{requireHealthy();return requireUser(auth.session(token));};
       if(user&&pathname.startsWith('/api/')) rate(`account:${user.id}`,accountRateLimit);
-      if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id)),rules:auth.rulesStatus(user?.id),...((voiceSocketPath||presentations)?{features:{...(voiceSocketPath?{voice:true}:{}),...(presentations?{presentation:true}:{})}}:{})});
+      if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id)),rules:auth.rulesStatus(user?.id),features:{eventPlans:true,...(voiceSocketPath?{voice:true}:{}),...(presentations?{presentation:true}:{})}});
+      const eventPlanRoute=pathname.match(/^\/api\/event-plans(?:\/([a-f0-9-]{36}))?$/);
+      if(eventPlanRoute) {
+        const actor=requireUser(user),planId=eventPlanRoute[1];
+        if(searchParams.size)fail(400,'invalid_scope');
+        if(req.method==='GET')return json(res,200,planId?eventPlans.get(actor,planId):eventPlans.list(actor));
+        if((req.method==='POST'&&!planId)||(req.method==='PATCH'&&planId)) {
+          store.ugcWriter(actor);
+          // Only this structured route accepts the larger bounded envelope.
+          // Session and rules are checked again after a slow body finishes.
+          const input=await body(req,65536),id=currentUserId();store.ugcWriter(id);
+          const result=planId?eventPlans.update(id,planId,input):eventPlans.create(id,input);
+          return json(res,planId||result.replayed?200:201,result);
+        }
+        if(req.method==='DELETE'&&planId) {
+          const input=await body(req);return json(res,200,eventPlans.delete(currentUserId(),planId,input));
+        }
+        fail(405,'method_not_allowed');
+      }
       if(presentations) {
         const ownRoute=pathname.match(/^\/api\/presentation(?:\/(publish|unpublish|photo|video))?$/);
         if(ownRoute) {
@@ -289,20 +319,34 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       const authRoute=pathname.match(/^\/api\/auth\/(register|login|recover|logout)$/);
       if(req.method==='POST'&&authRoute) {
         const action=authRoute[1];if(action!=='logout')rate(`auth-ip:${ip}`,authRateLimit,authWindowMs);
-        const input=await body(req);
+        const input=await body(req);requireHealthy();
         if(action==='logout') { fields(input,[]);auth.logout(token);setSession(res,null);return json(res,200,{user:null}); }
         if(typeof input.username==='string') rate(`auth-name:${hash(input.username.toLowerCase())}`,authAccountRateLimit,authWindowMs);
         else if(action==='recover') rate(`auth-recovery:${hash(typeof input.recoveryCode==='string'?input.recoveryCode:'invalid-recovery-code')}`,authAccountRateLimit,authWindowMs);
         const result=await auth[action](input);
+        requireHealthy();
+        if(auth.session(result.sessionToken)?.id!==result.user.id)fail(401,'login_required');
         auth.logout(token);setSession(res,result.sessionToken);
         return json(res,action==='register'?201:200,{user:result.user,rules:result.rules,...(result.recoveryCode?{recoveryCode:result.recoveryCode}:{})});
       }
       if(req.method==='DELETE'&&pathname==='/api/account') {
         requireUser(user);rate(`auth-ip:${ip}`,authRateLimit,authWindowMs);rate(`auth-name:${hash(user.username)}`,authAccountRateLimit,authWindowMs);
         const input=await body(req);fields(input,['password']);currentUserId();
-        const verification=await auth.login({username:user.username,password:input.password});
-        try { store.transaction(()=>{store.eraseAccountData(user.id);auth.deleteAccount(user.id);}); }
-        catch(error) { auth.logout(verification.sessionToken);throw error; }
+        const verification=await auth.verifyPassword({username:user.username,password:input.password});
+        if(currentUserId()!==user.id||verification.id!==user.id)fail(401,'login_required');
+        if(erasureJournal) {
+          try {
+            // The journal commit is independent and precedes the app commit.
+            // Even an ambiguous journal failure requires closed service until
+            // startup reconciliation; never serve possibly erased data.
+            const receipt=erasureJournal.append(user.id,clock());
+            store.transaction(()=>{store.eraseAccountData(user.id);auth.deleteAccount(user.id);acknowledgeErasure(db,erasureJournal,receipt);});
+          }catch{
+            erasureFault=true;failStreams();
+            try{server.emit('erasure-fault');}catch{/* An observer cannot reopen a suspended API. */}
+            fail(503,'account_erasure_pending');
+          }
+        }else store.transaction(()=>{store.eraseAccountData(user.id);auth.deleteAccount(user.id);});
         setSession(res,null);res.writeHead(204);return res.end();
       }
       if(req.method==='GET'&&(pathname==='/api/state'||pathname==='/api/events')) {
@@ -402,11 +446,11 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
   });
   server.requestTimeout=10_000;server.headersTimeout=10_000;server.keepAliveTimeout=5000;server.maxHeadersCount=40;server.maxConnections=512;
   function failStreams() { for(const stream of streams)stream.res.end('event: unavailable\ndata: {}\n\n');streams.clear(); }
-  const sweepTimer=setInterval(()=>{try{store.sweep();}catch{failStreams();}},sweepIntervalMs);sweepTimer.unref();
+  const sweepTimer=setInterval(()=>{if(erasureFault)return;try{store.sweep();}catch{failStreams();}},sweepIntervalMs);sweepTimer.unref();
   const heartbeat=setInterval(()=>{for(const stream of streams)if(validStream(stream))stream.res.write(': heartbeat\n\n');},heartbeatIntervalMs);heartbeat.unref();
   function dispose(){disposed=true;clearInterval(sweepTimer);clearInterval(heartbeat);unsubscribe();unsubscribePrivate();privateReaders.clear();for(const stream of streams)stream.res.end();streams.clear();}
   server.once('close',dispose);
-  return {server,store,auth,presentations,async close(){dispose();if(!server.listening)return;await new Promise((resolve,reject)=>{server.close(error=>error?reject(error):resolve());server.closeAllConnections();});}};
+  return {server,store,auth,presentations,eventPlans,async close(){dispose();if(!server.listening)return;await new Promise((resolve,reject)=>{server.close(error=>error?reject(error):resolve());server.closeAllConnections();});}};
 }
 
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
@@ -417,8 +461,9 @@ if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.ur
   if(allowLocalHttp&&!['127.0.0.1','localhost','::1'].includes(host))throw new Error('Local HTTP must bind loopback');
   if(!process.env.DATABASE_PATH||!path.isAbsolute(process.env.DATABASE_PATH))throw new Error('An absolute DATABASE_PATH is required');
   const db=openDatabase(process.env.DATABASE_PATH);
-  let app;try{app=createProductionServer({db,publicOrigin,allowLocalHttp,voiceSocketPath:process.env.VOICE_SOCKET||null,presentationSocketPath:process.env.PRESENTATION_SOCKET||null,moderators:(process.env.MODERATOR_IDS||'').split(',').filter(Boolean),trustedProxyAddresses:(process.env.TRUSTED_PROXY_IPS||'').split(',').filter(Boolean)});}catch(error){db.close();throw error;}
-  app.server.on('error',error=>{console.error(`Production server startup failed: ${error.code||'unknown_error'}`);app.close().finally(()=>db.close());process.exitCode=1;});
+  let app,journal;try{journal=process.env.ERASURE_JOURNAL_PATH?new ErasureJournal(process.env.ERASURE_JOURNAL_PATH):null;app=createProductionServer({db,publicOrigin,allowLocalHttp,erasureJournal:journal,voiceSocketPath:process.env.VOICE_SOCKET||null,presentationSocketPath:process.env.PRESENTATION_SOCKET||null,moderators:(process.env.MODERATOR_IDS||'').split(',').filter(Boolean),trustedProxyAddresses:(process.env.TRUSTED_PROXY_IPS||'').split(',').filter(Boolean)});}catch(error){journal?.close();db.close();throw error;}
+  app.server.on('error',error=>{console.error(`Production server startup failed: ${error.code||'unknown_error'}`);app.close().finally(()=>{journal?.close();db.close();});process.exitCode=1;});
+  app.server.on('erasure-fault',()=>console.error(JSON.stringify({level:'error',event:'erasure_reconciliation_required',apiSuspended:true})));
   app.server.listen(port,host,()=>console.log('Production listener ready; use the configured public origin.'));
-  for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>{app.close().then(()=>db.close()).catch(()=>{process.exitCode=1;});});
+  for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>{app.close().then(()=>{journal?.close();db.close();}).catch(()=>{process.exitCode=1;});});
 }

@@ -5,8 +5,14 @@ node_modules/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.sqlite-journal
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.log
 *.key
 *.pem
 *.tseb
 .DS_Store
+# Operator configuration, erasure pins/status and keys belong outside the source tree.

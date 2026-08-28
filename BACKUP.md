@@ -36,7 +36,7 @@ Après un dépassement de budget, conserver les points existants et décider d�
 
 ## Restauration et suppression des comptes
 
-Fermer l’accès public, arrêter uniquement l’application, garder la base actuelle comme retour arrière et restaurer vers un **nouveau** chemin. Ne pas écraser un SQLite actif ni réutiliser ses anciens WAL/SHM. Vérifier intégrité, version de schéma, droits, expiration des contenus et comptes ; rejouer les demandes d’effacement intervenues après le point restauré avant toute réouverture. La source opérationnelle permettant cette réconciliation doit être organisée avant public.
+Fermer l’accès public, arrêter uniquement l’application, garder la base actuelle comme retour arrière et restaurer vers un **nouveau** chemin. Ne pas écraser un SQLite actif ni réutiliser ses anciens WAL/SHM. Vérifier intégrité, version de schéma, droits, expiration des contenus et comptes ; rejouer les demandes d’effacement intervenues après le point restauré avant toute réouverture. Le [journal indépendant](ERASURE.md) et ses outils sont fournis, mais son activation, sa copie hors serveur et une référence actuelle sont à organiser avant public. L’outil de préparation ne donne jamais d’autorisation d’ouverture.
 
 Une suppression du compte dans la base active n’efface pas instantanément une ancienne archive chiffrée. Publier la durée de conservation réellement appliquée et la procédure correspondante avant d’ouvrir le service. Le modèle de7jours ne constitue pas à lui seul une preuve de rotation en exploitation.
 
