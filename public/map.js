@@ -1,3 +1,5 @@
+import { preserveLiveFocus } from './live-focus.js';
+
 // Viewport-only OSM tile rendering. Browser cache is preserved; no prefetch or offline download.
 const TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 const HOME = { lat: 48.8689, lng: 2.3598 };
@@ -71,6 +73,7 @@ export class LocalMap {
     this.renderPins();
   }
   renderPins() {
+    return preserveLiveFocus(this.pins, () => {
     const width = this.element.clientWidth, height = this.element.clientHeight;
     if (!width || !height) return;
     const center = project(this.center.lat, this.center.lng, this.zoom);
@@ -84,7 +87,7 @@ export class LocalMap {
       if (x < -80 || x > width + 80 || y < 20 || y > height - 15) continue;
       const button = document.createElement('button');
       button.className = `map-pin ${(this.fresh.get(post.id) || 0) > Date.now() ? 'fresh' : ''} ${post.kind === 'need' ? 'need' : ''} ${post.status === 'full' ? 'full' : ''} ${post.id === this.selected ? 'selected' : ''}`;
-      button.dataset.post = post.id;
+      button.dataset.post = post.id; button.dataset.focusKey = `post-${post.id}`;
       button.setAttribute('aria-label', `${post.role}, ${post.zoneLabel}, ${post.status === 'full' ? 'clôturé' : post.kind === 'available' ? 'disponible' : `${post.places} place${post.places > 1 ? 's' : ''}`}${post.demo ? ', exemple' : ''}`);
       button.setAttribute('aria-pressed', String(post.id === this.selected));
       button.innerHTML = this.pinHTML(post); this.pins.append(button);
@@ -108,6 +111,7 @@ export class LocalMap {
         this.pins.prepend(anchor,leader);
       }
     }
-    if (overflow) { const more = document.createElement('button'); more.className = 'map-overflow'; more.textContent = `+ ${overflow} annonces · voir le fil`; more.addEventListener('click', () => this.onOverflow?.()); this.pins.append(more); }
+    if (overflow) { const more = document.createElement('button'); more.className = 'map-overflow'; more.dataset.focusKey = 'more-posts'; more.textContent = `+ ${overflow} annonces · voir le fil`; more.addEventListener('click', () => this.onOverflow?.()); this.pins.append(more); }
+    }, this.element);
   }
 }

@@ -10,6 +10,7 @@ import {createBackup} from '../backup.mjs';
 import {backupKey,encryptBackup,decryptBackup} from '../ops/backup-crypto.mjs';
 import {runBackup,waitForLiveWal} from '../ops/backup-job.mjs';
 import {pullBackup,readPullConfig,createSSHTransport} from '../ops/backup-pull.mjs';
+import {runPullJob,checkPullJob} from '../ops/backup-pull-job.mjs';
 
 async function fixture(t){const dir=await mkdtemp(path.join(tmpdir(),'thesocialextra-backup-'));t.after(()=>rm(dir,{recursive:true,force:true}));return {dir,file:name=>path.join(dir,name)};}
 test('online SQLite backup encrypts and restores to an authenticated, intact separate database',async t=>{
@@ -404,4 +405,131 @@ test('forced reader counts foreign entries toward the scan limit and emits no pa
   const command=readerCommand({directory,operation:'list'}),result=await runReader(directory,command);
   assert.equal(result.code,0);assert.deepEqual(JSON.parse(result.stdout),[]);assert.equal(result.stderr.length,0);
   await writeFile(path.join(directory,'one-too-many'),'');readerRefused(await runReader(directory,command));
+});
+
+async function scheduledFixture(t){
+  const f=await pullFixture(t),parent=path.join(await realpath(f.dir),'status');await mkdir(parent,{mode:0o700});
+  const configFile=path.join(parent,'config.json'),statusFile=path.join(parent,'pull.json');
+  await writeFile(configFile,JSON.stringify(f.config),{mode:0o600});let current=f.options.now;
+  const result={filename:f.entry.name,bytes:f.entry.bytes,restoredIntegrity:'ok',alreadyPresent:false,removed:0};
+  const options={now:()=>current,pull:async()=>({...result})};
+  return {...f,parent,configFile,statusFile,result,setNow:value=>{current=value;},
+    run:extra=>runPullJob(configFile,statusFile,{...options,...extra}),check:()=>checkPullJob(statusFile,{now:()=>current})};
+}
+
+test('scheduled pull persists the running attempt before transfer and a private verified attestation after it',async t=>{
+  const f=await scheduledFixture(t);let observed;
+  const outcome=await f.run({pull:async(config,options)=>{
+    observed=JSON.parse(await readFile(f.statusFile,'utf8'));assert.equal(observed.outcome,'running');assert.equal(observed.point,null);
+    assert.equal((await stat(f.statusFile)).mode&0o777,0o600);assert.equal((await stat(f.statusFile+'.lock')).mode&0o777,0o700);
+    assert.equal((await f.check()).error,'job_locked');assert.deepEqual(config,f.config);
+    return pullBackup(config,{...options,transport:f.transport,minFreeBytes:0});
+  }});
+  assert.equal(outcome.ok,true);assert.equal(outcome.error,null);assert.equal(outcome.status.outcome,'ok');
+  assert.equal(outcome.status.point.filename,f.entry.name);assert.equal(outcome.status.point.verifiedAt,f.options.now);
+  assert.deepEqual(JSON.parse(await readFile(f.statusFile,'utf8')),outcome.status);
+  assert.deepEqual((await readdir(f.parent)).sort(),['config.json','pull.json']);
+  assert.equal((await stat(f.statusFile)).mode&0o777,0o600);
+  // Check is an attestation reader, not another transfer or crypto/archive check.
+  const before=await stat(f.statusFile),bytes=await readFile(f.statusFile);
+  await rm(f.configFile);await rm(f.config.keyFile);await rm(f.config.localDirectory,{recursive:true});
+  assert.equal((await f.check()).ok,true);assert.deepEqual(await readFile(f.statusFile),bytes);
+  assert.equal((await stat(f.statusFile)).mtimeMs,before.mtimeMs);
+});
+
+test('scheduled pull keeps a useful six-day-old copy but reports stale independently of seven-day retention',async t=>{
+  const f=await scheduledFixture(t),entry={...f.entry,name:f.entry.name.replace('2026-08-28','2026-08-22')};
+  const outcome=await f.run({pull:(config,options)=>pullBackup(config,{...options,minFreeBytes:0,transport:{list:async()=>[entry],read:f.transport.read}})});
+  assert.equal(outcome.ok,false);assert.equal(outcome.error,'snapshot_stale');assert.equal(outcome.status.outcome,'stale');
+  assert.deepEqual(await readFile(path.join(f.config.localDirectory,entry.name)),f.ciphertext);
+  assert.equal((f.options.now-outcome.status.point.snapshotAt)/3600000,144);assert.equal((await f.check()).error,'snapshot_stale');
+});
+
+test('scheduled pull failures preserve the verified point and only persist allowlisted error codes',async t=>{
+  const f=await scheduledFixture(t),first=await f.run();f.setNow(f.options.now+1000);
+  for(const problem of [Object.assign(new Error('synthetic private diagnostic'),{code:'synthetic/private/value'}),Object.assign(new Error(f.dir),{code:'transport_failed'})]){
+    const result=await f.run({pull:async()=>{throw problem;}});
+    assert.equal(result.ok,false);assert.equal(result.status.outcome,'error');assert.deepEqual(result.status.point,first.status.point);
+    assert.equal(result.error,problem.code==='transport_failed'?'transport_failed':'pull_failed');
+    assert.equal((await f.check()).ok,false);assert.ok(!(await readFile(f.statusFile,'utf8')).includes('synthetic'));
+    assert.ok(!JSON.stringify(result).includes(f.dir));
+  }
+  await chmod(f.configFile,0o644);const invalid=await f.run({pull:async()=>assert.fail('invalid config must not start transfer')});
+  assert.equal(invalid.error,'invalid_pull_config');assert.deepEqual(invalid.status.point,first.status.point);
+  assert.deepEqual((await readdir(f.parent)).sort(),['config.json','pull.json']);
+});
+
+test('scheduled check enforces attempt age, point age, clock skew and unfinished attempts without changing status',async t=>{
+  const f=await scheduledFixture(t),first=await f.run(),original=await readFile(f.statusFile);
+  f.setNow(f.options.now+3*3600000);assert.equal((await f.check()).ok,true);
+  f.setNow(f.options.now+3*3600000+1);assert.equal((await f.check()).error,'attempt_stale');assert.deepEqual(await readFile(f.statusFile),original);
+  f.setNow(f.options.now-300001);assert.equal((await f.check()).error,'clock_invalid');f.setNow(f.options.now);
+  f.setNow(f.options.now-1);const regressed=await f.run({pull:async()=>assert.fail('clock regression must stop transfer')});
+  assert.equal(regressed.error,'clock_invalid');assert.equal(regressed.status.outcome,'error');assert.equal((await f.check()).ok,false);
+  f.setNow(f.options.now);assert.equal((await f.run()).ok,true);
+  const nameAt=at=>`snapshot-${new Date(at).toISOString().replace('.000Z','Z').replaceAll(':','-')}-00000000-0000-4000-8000-000000000000.tseb`;
+  const boundary=await f.run({pull:async()=>({...f.result,filename:nameAt(f.options.now-36*3600000)})});assert.equal(boundary.ok,true);
+  f.setNow(f.options.now+1);assert.equal((await f.check()).error,'snapshot_stale');f.setNow(f.options.now);
+  assert.equal((await f.run({pull:async()=>({...f.result,filename:nameAt(f.options.now+300000)})})).ok,true);
+  const future=await f.run({pull:async()=>({...f.result,filename:nameAt(f.options.now+301000)})});assert.equal(future.error,'clock_invalid');
+  const running={...first.status,outcome:'running',finishedAt:null,error:null};await writeFile(f.statusFile,JSON.stringify(running));
+  assert.equal((await f.check()).error,'attempt_in_progress');f.setNow(f.options.now+4*3600000);assert.equal((await f.check()).ok,false);
+  assert.deepEqual(JSON.parse(await readFile(f.statusFile,'utf8')),running);
+});
+
+test('scheduled pull lock excludes concurrent runs and never removes an abandoned lock',async t=>{
+  const f=await scheduledFixture(t);let release,entered;
+  const started=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  const running=f.run({pull:async()=>{entered();await gate;return f.result;}});await started;
+  try{
+    assert.equal((await f.run()).error,'job_locked');assert.equal((await f.check()).error,'job_locked');
+    assert.equal(JSON.parse(await readFile(f.statusFile,'utf8')).outcome,'running');
+  }finally{release();}
+  assert.equal((await running).ok,true);await mkdir(f.statusFile+'.lock',{mode:0o700});
+  await writeFile(path.join(f.statusFile+'.lock','inspect-before-removal'),'synthetic lock evidence');
+  assert.equal((await f.run()).error,'job_locked');assert.equal((await f.check()).error,'job_locked');
+  assert.deepEqual(await readdir(f.statusFile+'.lock'),['inspect-before-removal']);
+});
+
+test('scheduled status rejects absent, oversized, corrupt and non-exact metadata without overwriting it',async t=>{
+  const f=await scheduledFixture(t);assert.equal((await f.check()).error,'status_missing');const valid=(await f.run()).status;
+  for(const content of ['{','x'.repeat(8193),JSON.stringify({...valid,configuration:f.config}),JSON.stringify({...valid,outcome:'error',error:'private/arbitrary'}),
+    JSON.stringify({...valid,point:{...valid.point,filename:'../secret'}}),JSON.stringify(valid).replace('"version":1','"version":1,"version":1')]){
+    await writeFile(f.statusFile,content);assert.equal((await f.check()).error,'status_invalid');
+    assert.equal((await f.run({pull:async()=>assert.fail('corrupt status must stop transfer')})).error,'status_invalid');
+    assert.equal(await readFile(f.statusFile,'utf8'),content);await assert.rejects(stat(f.statusFile+'.lock'),{code:'ENOENT'});
+  }
+});
+
+test('scheduled status rejects unsafe paths, permissions, symlinks and a different current owner',async t=>{
+  const f=await scheduledFixture(t);await f.run();
+  assert.equal((await checkPullJob('relative.json')).error,'invalid_job_path');
+  assert.equal((await checkPullJob(path.resolve('private-status-must-not-exist.json'))).error,'private_path_inside_source');
+  assert.equal((await runPullJob('relative-config',f.statusFile)).error,'invalid_job_path');
+  await chmod(f.parent,0o750);assert.equal((await f.check()).error,'status_directory_permissions');await chmod(f.parent,0o700);
+  await chmod(f.statusFile,0o644);assert.equal((await f.check()).error,'status_file_permissions');assert.equal((await f.run()).error,'status_file_permissions');await chmod(f.statusFile,0o600);
+  const linkFile=path.join(f.parent,'linked-status'),linkParent=path.join(await realpath(f.dir),'linked-parent');
+  await symlink(f.statusFile,linkFile);await symlink(f.parent,linkParent);
+  assert.equal((await checkPullJob(linkFile)).ok,false);assert.equal((await checkPullJob(path.join(linkParent,'pull.json'))).error,'status_directory_permissions');
+  assert.equal((await runPullJob(f.configFile,linkFile)).ok,false);assert.equal((await stat(f.statusFile)).mode&0o777,0o600);
+  const original=process.getuid;try{process.getuid=()=>original()+1;assert.equal((await f.check()).error,'status_directory_permissions');}finally{process.getuid=original;}
+});
+
+test('scheduled final publication refuses a substituted symlink and leaves its lock for inspection',async t=>{
+  const f=await scheduledFixture(t),foreign=path.join(f.parent,'foreign');await writeFile(foreign,'synthetic foreign file',{mode:0o600});
+  const result=await f.run({pull:async()=>{await rm(f.statusFile);await symlink(foreign,f.statusFile);return f.result;}});
+  assert.equal(result.ok,false);assert.equal(await readFile(foreign,'utf8'),'synthetic foreign file');
+  assert.equal((await f.check()).error,'job_locked');assert.ok(!(await readdir(f.parent)).some(name=>name.endsWith('.tmp')));
+});
+
+test('scheduled CLI check is read-only and uses nonzero exit for missing or failed attestations',async t=>{
+  const f=await scheduledFixture(t);await f.run({pull:async()=>{throw new Error('synthetic private failure');}});
+  const content=await readFile(f.statusFile);await rm(f.configFile);
+  for(const filename of [f.statusFile,path.join(f.parent,'missing.json')]){
+    const child=spawn(process.execPath,['ops/backup-pull-job.mjs','--check',filename],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';
+    child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+    const code=await new Promise(resolve=>child.once('close',resolve));assert.equal(code,1);assert.equal(stderr,'');
+    const result=JSON.parse(stdout);assert.equal(result.ok,false);assert.ok(!stdout.includes(f.dir));assert.ok(!stdout.includes('synthetic'));
+  }
+  assert.deepEqual(await readFile(f.statusFile),content);assert.deepEqual(await readdir(f.parent),['pull.json']);
 });

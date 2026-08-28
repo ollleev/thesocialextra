@@ -3,6 +3,90 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { MessageOutbox, requestJSON } from '../public/requests.js';
+import { preserveLiveFocus, captureLiveOpener, restoreLiveOpener } from '../public/live-focus.js';
+import { LocalMap } from '../public/map.js';
+
+function focusFixture() {
+  const document={body:{isConnected:true},activeElement:null,querySelector(){return this.openDialog??null;}};document.activeElement=document.body;
+  const node=key=>({dataset:key?{focusKey:key}:{},isConnected:true,disabled:false,style:{},offsetWidth:70,offsetHeight:32,
+    setAttribute(){},addEventListener(){},getClientRects(){return this.hidden?[]:[{}];},focus(options){this.focusOptions=options;document.activeElement=this;},remove(){this.isConnected=false;},
+  });
+  const fallback=node(),container={ownerDocument:document,children:[],
+    contains(value){return this.children.includes(value);},querySelectorAll(){return this.children.filter(child=>child.isConnected&&child.dataset.focusKey);},
+    replaceChildren(...children){for(const child of this.children){child.isConnected=false;if(document.activeElement===child)document.activeElement=document.body;}this.children=children;},
+    append(...children){this.children.push(...children);},prepend(...children){this.children.unshift(...children);},
+  };
+  document.createElement=()=>node();
+  return {document,node,container,fallback};
+}
+
+test('live redraw restores the same action by key, never by its changed list position',()=>{
+  const f=focusFixture(),old=f.node('post-older'),replacement=f.node('post-older'),newer=f.node('post-newer');
+  f.container.append(old);f.document.activeElement=old;
+  const result=preserveLiveFocus(f.container,()=>{f.container.replaceChildren(newer,replacement);return 7;},f.fallback);
+  assert.equal(result,7);assert.equal(f.document.activeElement,replacement);assert.deepEqual(replacement.focusOptions,{preventScroll:true});
+  preserveLiveFocus(f.container,()=>f.container.replaceChildren(newer),f.fallback);
+  assert.equal(f.document.activeElement,f.fallback);
+});
+
+test('live redraw never steals focus from an unrelated input or a newly opened dialog',()=>{
+  const f=focusFixture(),old=f.node('post-a'),input=f.node(),dialog=f.node();f.container.append(old);f.document.activeElement=input;
+  preserveLiveFocus(f.container,()=>f.container.replaceChildren(f.node('post-a')),f.fallback);assert.equal(f.document.activeElement,input);
+  f.document.activeElement=f.container.children[0];
+  preserveLiveFocus(f.container,()=>{f.container.replaceChildren(f.node('post-a'));dialog.focus();},f.fallback);
+  assert.equal(f.document.activeElement,dialog);
+  const current=f.container.children[0];current.focus();
+  preserveLiveFocus(f.container,()=>{},f.fallback);assert.equal(f.document.activeElement,current);assert.equal(current.focusOptions,undefined);
+});
+
+test('disabled replacement falls back and arbitrary key text is compared as data, not a CSS selector',()=>{
+  const f=focusFixture(),key='post-\"] #private-input',old=f.node(key),replacement=f.node(key);
+  f.container.append(old);old.focus();preserveLiveFocus(f.container,()=>f.container.replaceChildren(replacement),f.fallback);
+  assert.equal(f.document.activeElement,replacement);
+  const disabled=f.node(key);disabled.disabled=true;
+  preserveLiveFocus(f.container,()=>f.container.replaceChildren(disabled),f.fallback);assert.equal(f.document.activeElement,f.fallback);
+});
+
+test('actual map pin redraw preserves its focused post and falls back to map after removal',t=>{
+  const f=focusFixture(),oldDocument=globalThis.document;globalThis.document=f.document;t.after(()=>{globalThis.document=oldDocument;});
+  const element=Object.assign(f.fallback,{clientWidth:400,clientHeight:400});
+  const map={element,pins:f.container,center:{lat:48.86,lng:2.35},zoom:13,fresh:new Map(),selected:null,pinHTML:()=>'',
+    posts:[{id:'synthetic-post',lat:48.86,lng:2.35,role:'Plongeur',zoneLabel:'Zone synthétique',status:'open',kind:'available'}]};
+  LocalMap.prototype.renderPins.call(map);const first=f.container.children.find(node=>node.dataset.post);first.focus();
+  LocalMap.prototype.renderPins.call(map);const second=f.container.children.find(node=>node.dataset.post);
+  assert.notEqual(first,second);assert.equal(f.document.activeElement,second);assert.equal(second.dataset.focusKey,'post-synthetic-post');
+  map.posts=[];LocalMap.prototype.renderPins.call(map);assert.equal(f.document.activeElement,element);
+});
+
+test('a detail opener survives several background redraws as an action key rather than a detached DOM node',()=>{
+  for(const key of ['post-synthetic','detail-synthetic']){
+    const f=focusFixture(),button=f.node(key);f.container.append(button);button.focus();
+    const opener=captureLiveOpener([f.container]);f.document.openDialog={};f.document.activeElement=f.node();
+    for(let i=0;i<3;i++)preserveLiveFocus(f.container,()=>f.container.replaceChildren(f.node(key)),f.fallback);
+    assert.equal(button.isConnected,false);assert.equal(f.document.activeElement.dataset.focusKey,undefined);
+    f.document.openDialog=null;f.document.activeElement=f.document.body;
+    restoreLiveOpener(opener,[f.fallback]);assert.equal(f.document.activeElement,f.container.children[0]);
+    assert.deepEqual(f.document.activeElement.focusOptions,{preventScroll:true});
+  }
+});
+
+test('return from a removed or hidden announcement chooses a visible fallback without focusing another post',()=>{
+  const f=focusFixture(),button=f.node('post-a');f.container.append(button);button.focus();const opener=captureLiveOpener([f.container]);
+  const hidden=f.node('post-a');hidden.hidden=true;f.container.replaceChildren(hidden,f.node('post-b'));
+  const hiddenMap=f.node();hiddenMap.hidden=true;restoreLiveOpener(opener,[hiddenMap,f.fallback]);
+  assert.equal(f.document.activeElement,f.fallback);
+});
+
+test('a late detail close cannot steal focus from a reopened dialog, another dialog or a chosen page control',()=>{
+  const f=focusFixture(),button=f.node('post-a');f.container.append(button);button.focus();const opener=captureLiveOpener([f.container]);
+  f.container.replaceChildren(f.node('post-a'));
+  for(const dialog of [{id:'chat'},{id:'account'},{id:'detail'}]){
+    f.document.openDialog=dialog;f.document.activeElement=f.document.body;restoreLiveOpener(opener,[f.fallback]);
+    assert.equal(f.document.activeElement,f.document.body);
+  }
+  f.document.openDialog=null;const chosen=f.node();chosen.focus();restoreLiveOpener(opener,[f.fallback]);assert.equal(f.document.activeElement,chosen);
+  assert.equal(captureLiveOpener([f.container]),null);
+});
 
 test('drafts and delayed send results are isolated by conversation and edit version', () => {
   const box = new MessageOutbox(() => 'intent-key');
