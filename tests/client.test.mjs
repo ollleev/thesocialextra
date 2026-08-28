@@ -463,3 +463,116 @@ test('area lookup failure keeps the current city/feed and leaves a retryable vis
   const f=areaSearchFixture(),result=f.context.searchMapArea();f.calls[0].reject(Object.assign(Error(),{code:'no_nearby_location'}));await result;
   assert.equal(f.selections.length,0);assert.equal(f.$('#search-map-area').disabled,false);assert.match(f.$('#map-search-status').textContent,/Pas de ville proche/);
 });
+
+// Ollama Cloud tests; Codex adapted shared imports/names and strengthened the transition/reset harness.
+function extractQuantityComposer(src) {
+  const start = src.indexOf('function openComposer(');
+  assert.ok(start !== -1, 'openComposer introuvable');
+  let depth = 0, end = -1;
+  for (let i = src.indexOf('{', start); i < src.length; i++) {
+    const c = src[i];
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+  }
+  assert.ok(end !== -1, 'fin de openComposer introuvable');
+  return src.slice(start, end);
+}
+
+function composeQuantityFixture() {
+  const places = {
+    value: '1',
+    required: false,
+    disabled: false,
+    setAttribute(n, v) { if (n === 'required') this.required = v !== null; if (n === 'disabled') this.disabled = v !== null; },
+    removeAttribute(n) { if (n === 'required') this.required = false; if (n === 'disabled') this.disabled = false; }
+  };
+  const needFields = { hidden: false };
+  const postForm = {
+    reset() { places.value = '1'; }
+  };
+  const composer = { open: false, classList: { add() {}, remove() {} }, close() { this.open = false; }, showModal() { this.open = true; }, show() { this.open = true; } };
+  const formZone = { disabled: false, value: '' };
+  const formZoneControl = { hidden: false };
+  const formCity = { textContent: '' };
+  const composeTitle = { textContent: '' };
+  const composeDescription = { textContent: '' };
+  const roleLegend = { textContent: '' };
+  const publishButton = { innerHTML: '', focus() {} };
+  const formError = { hidden: true, textContent: '' };
+  const composeSymbol = { setAttribute() {} };
+  const $ = sel => {
+    if (sel === '#composer') return composer;
+    if (sel === '#post-form') return postForm;
+    if (sel === '#post-form [name="places"]') return places;
+    if (sel === '#need-fields') return needFields;
+    if (sel === '#form-zone') return formZone;
+    if (sel === '#form-zone-control') return formZoneControl;
+    if (sel === '#form-city') return formCity;
+    if (sel === '#compose-title') return composeTitle;
+    if (sel === '#compose-description') return composeDescription;
+    if (sel === '#role-legend') return roleLegend;
+    if (sel === '#publish-button') return publishButton;
+    if (sel === '#form-error') return formError;
+    if (sel === '#compose-symbol') return composeSymbol;
+    throw new Error('selecteur non supporté: ' + sel);
+  };
+  const state = { city: { id: '2988507', label: 'Paris' }, point: null, zone: 'all' };
+  const ctx = {
+    $,
+    state,
+    publishing: false,
+    composerGeneration: 0,
+    openDialog() {},
+    toast() {},
+    requireUGC() { return true; },
+    icon(name) { return '<svg data-icon="' + name + '"></svg>'; },
+    console
+  };
+  vm.createContext(ctx);
+  return { ctx, places, needFields };
+}
+
+test('openComposer need puis available puis need synchronise required/disabled et reset value', () => {
+  const { ctx, places, needFields } = composeQuantityFixture();
+  vm.runInContext(extractQuantityComposer(appSource), ctx);
+  ctx.openComposer('need');
+  assert.equal(needFields.hidden, false);
+  assert.equal(places.required, true);
+  assert.equal(places.disabled, false);
+  assert.equal(places.value, '1');
+  places.value = '5';
+  ctx.openComposer('available');
+  assert.equal(needFields.hidden, true);
+  assert.equal(places.required, false);
+  assert.equal(places.disabled, true);
+  assert.equal(places.value, '1');
+  ctx.openComposer('need');
+  assert.equal(needFields.hidden, false);
+  assert.equal(places.required, true);
+  assert.equal(places.disabled, false);
+  assert.equal(places.value, '1');
+});
+
+test('openComposer available rend places non required, disabled et masque need-fields', () => {
+  const { ctx, places, needFields } = composeQuantityFixture();
+  const code = extractQuantityComposer(appSource) + `\nopenComposer('available');`;
+  vm.runInContext(code, ctx);
+  assert.equal(needFields.hidden, true);
+  assert.equal(places.required, false);
+  assert.equal(places.disabled, true);
+});
+
+test('openComposer early-return publishing=true ne modifie pas la saisie/etat', () => {
+  const { ctx, places, needFields } = composeQuantityFixture();
+  places.required = true;
+  places.disabled = false;
+  places.value = '5';
+  needFields.hidden = false;
+  ctx.publishing = true;
+  const code = extractQuantityComposer(appSource) + `\nopenComposer('available');`;
+  vm.runInContext(code, ctx);
+  assert.equal(needFields.hidden, false);
+  assert.equal(places.required, true);
+  assert.equal(places.disabled, false);
+  assert.equal(places.value, '5');
+});

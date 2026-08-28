@@ -238,7 +238,7 @@ function openComposer(kind) {
   if(!requireUGC(()=>openComposer(kind))) return;
   if (publishing) { openDialog($('#composer')); toast('Publication en cours. Attendez sa confirmation.'); return; }
   ++composerGeneration;
-  state.formKind = kind; $('#post-form').reset(); $('#need-fields').hidden = kind !== 'need';
+  state.formKind = kind; $('#post-form').reset(); $('#need-fields').hidden = kind !== 'need'; $('#post-form [name="places"]').required = kind === 'need'; $('#post-form [name="places"]').disabled = kind !== 'need';
   $('#compose-title').textContent = kind === 'available' ? 'Dispo, maintenant.' : 'Un renfort, maintenant.';
   $('#compose-description').textContent = kind === 'available' ? 'Quelques cases. Et vous êtes dans le coin.' : 'Dites ce qu’il vous manque. Parlez-vous directement.';
   $('#role-legend').textContent = kind === 'available' ? 'Je suis…' : 'Je cherche…';
