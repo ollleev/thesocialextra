@@ -143,10 +143,28 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     }
     return true;
   }
-  function sendState(stream) {
-    if(!validStream(stream)) return;
-    try { const snapshot=store.state(stream.scope,stream.userId);stream.res.write(`event: state\ndata: ${JSON.stringify(snapshot)}\n\n`); }
-    catch { stream.res.end('event: unavailable\ndata: {}\n\n');streams.delete(stream); }
+  function sendStates(targets) {
+    // Both the reader and serialized frames die with this synchronous batch.
+    // Sharing never crosses an account or a scope, including mine and point.
+    targets=[...targets];if(!targets.length)return;
+    let readSnapshot;
+    try { readSnapshot=store.snapshotReader(); }
+    catch { for(const stream of targets){stream.res.end('event: unavailable\ndata: {}\n\n');streams.delete(stream);}return; }
+    const frames=new Map();
+    for(const stream of targets) {
+      if(!validStream(stream)) continue;
+      try {
+        const key=JSON.stringify([stream.userId??null,stream.scope]);
+        let frame=frames.get(key);
+        if(frame===undefined) {
+          frame=`event: state\ndata: ${JSON.stringify(readSnapshot(stream.scope,stream.userId))}\n\n`;
+          frames.set(key,frame);
+          // A synchronous calculation can still cross the session deadline.
+          if(!validStream(stream)) continue;
+        }
+        stream.res.write(frame);
+      } catch { stream.res.end('event: unavailable\ndata: {}\n\n');streams.delete(stream); }
+    }
   }
   function scheduleState() {
     if(disposed||scheduled||broadcasting) return;
@@ -154,7 +172,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     queueMicrotask(()=>{
       scheduled=false;if(disposed)return;
       broadcasting=true;
-      try { for(const stream of streams) sendState(stream); }
+      try { sendStates(streams); }
       finally { broadcasting=false; }
     });
   }
@@ -170,7 +188,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       if(disposed)return;
       // A reader's block must refresh all of their sessions, but reveal neither
       // its occurrence nor a version change to anonymous or unrelated streams.
-      for(const stream of streams)if(readers.has(stream.userId))sendState(stream);
+      sendStates([...streams].filter(stream=>readers.has(stream.userId)));
     });
   });
   const server=http.createServer(async(req,res)=>{

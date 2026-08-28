@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { openDatabase, backupDatabase } from '../database.mjs';
-import { ProductionStore, PRIVATE_RETENTION_MS, REPORT_RETENTION_MS } from '../production-store.mjs';
+import { ProductionStore, PRIVATE_RETENTION_MS, REPORT_RETENTION_MS, longitudeRanges } from '../production-store.mjs';
+import { distanceKm } from '../locations.mjs';
 
 const input = (overrides={}) => ({kind:'need',role:'Barman',cityId:'2988507',zoneId:'oberkampf',english:false,vehicle:false,durationMinutes:30,places:2,note:'Essai synthétique.',...overrides});
 const key = n => `test-production-intent-${n}`;
@@ -18,6 +19,54 @@ function fixture(t, options={}) {
   t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
   return {get db(){return db;},get store(){return store;},filename,dir,advance:ms=>now+=ms,reopen(){db.close();db=openDatabase(filename);store=make();return store;}};
 }
+
+test('snapshot reader sweeps once and uses one instant for public posts and ownership until the batch ends',t=>{
+  const f=fixture(t),store=f.store,post=store.create('owner',input(),key('batch-expiry')).post;
+  f.advance(30*60_000-1);let at=store.clock(),sweeps=0,clockReads=0;
+  const sweep=store.sweep.bind(store);store.sweep=now=>{sweeps++;return sweep(now);};store.clock=()=>{clockReads++;return at;};
+  const read=store.snapshotReader(),first=read({},'owner');at+=10;
+  const second=read({mine:true},'owner');
+  assert.equal(sweeps,1);assert.equal(clockReads,1);assert.equal(first.now,second.now);
+  for(const snapshot of [first,second]){assert.deepEqual(snapshot.posts.map(p=>p.id),[post.id]);assert.deepEqual(snapshot.ownedPostIds,[post.id]);assert.deepEqual(snapshot.ownedPosts.map(p=>p.id),[post.id]);}
+  const next=store.state({},'owner');assert.equal(sweeps,2);assert.equal(next.posts.length,0);assert.equal(next.ownedPosts.length,0);assert.equal(next.ownedPostIds.length,0);
+  assert.equal(next.version,first.version+1);assert.equal(next.now,at);
+});
+
+test('longitude prefilter contains every tested 25 km bearing, including poles and both antimeridian directions',()=>{
+  const origins=[{lat:0,lng:0},{lat:48.86,lng:2.35},{lat:82.5,lng:30},{lat:89.9,lng:179.95},{lat:-89.9,lng:-179.95},{lat:15,lng:179.99},{lat:-20,lng:-179.99}];
+  for(const origin of origins){
+    const ranges=longitudeRanges(origin),phi=origin.lat*Math.PI/180,lambda=origin.lng*Math.PI/180;
+    for(const km of [0,24,24.999999,25])for(let bearing=0;bearing<360;bearing+=15){
+      const angle=km/6371,theta=bearing*Math.PI/180;
+      const lat=Math.asin(Math.max(-1,Math.min(1,Math.sin(phi)*Math.cos(angle)+Math.cos(phi)*Math.sin(angle)*Math.cos(theta))));
+      const lng=lambda+Math.atan2(Math.sin(theta)*Math.sin(angle)*Math.cos(phi),Math.cos(angle)-Math.sin(phi)*Math.sin(lat));
+      const point={lat:lat*180/Math.PI,lng:((lng*180/Math.PI+540)%360)-180};
+      assert.ok(distanceKm(origin,point)<=25.000001);
+      assert.ok(ranges.some(([west,east])=>point.lng>=west&&point.lng<=east),JSON.stringify({origin,point,bearing,km}));
+      assert.ok(Math.abs(point.lat-origin.lat)<0.23);
+    }
+  }
+  for(const lat of [-90,-89.9,89.9,90])assert.deepEqual(longitudeRanges({lat,lng:0}),[[-180,180]]);
+  assert.equal(longitudeRanges({lat:0,lng:179.99}).length,2);assert.equal(longitudeRanges({lat:0,lng:-179.99}).length,2);
+});
+
+test('SQL longitude bounds cross the antimeridian and discard remote JSON before parsing without changing private counts',t=>{
+  const f=fixture(t),posts=[];
+  for(const [index,lng] of [179.98,-179.98].entries()){
+    const payload=input({cityId:'2204582',point:{lat:-16.43,lng}});delete payload.zoneId;
+    posts.push(f.store.create(`geo-owner-${index}`,payload,key(`geo-${index}`)).post);
+  }
+  const stamp=f.store.clock();
+  f.db.prepare('INSERT INTO app_posts(id,owner_id,data,lat,lng,expires_at,retain_until) VALUES(?,?,?,?,?,?,?)')
+    .run('synthetic-distant','synthetic-distant-owner','{invalid synthetic JSON',-16.43,170,stamp+3600000,stamp+PRIVATE_RETENTION_MS);
+  for(const lng of [179.99,-179.99]){
+    const snapshot=f.store.state({cityId:'2204582',point:{lat:-16.43,lng}});
+    assert.deepEqual(snapshot.posts.map(p=>p.id).sort(),posts.map(p=>p.id).sort());assert.equal(snapshot.total,2);assert.equal(snapshot.counts.all,2);
+  }
+  f.store.blockPost('geo-reader',posts[0].id);
+  const privateView=f.store.state({cityId:'2204582',point:{lat:-16.43,lng:179.99}},'geo-reader');
+  assert.deepEqual(privateView.posts.map(p=>p.id),[posts[1].id]);assert.equal(privateView.total,1);assert.equal(privateView.counts.all,1);
+});
 
 test('durable posts, messages and intents survive reopening; backup restores the same authorized state',async t=>{
   const f=fixture(t),{post}=f.store.create('owner',input(),key(1));

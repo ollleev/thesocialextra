@@ -14,6 +14,18 @@ const canonical = value => JSON.stringify(value && typeof value === 'object'
     : Object.fromEntries(Object.keys(value).sort().filter(key => value[key] !== undefined).map(key => [key, JSON.parse(canonical(value[key]))]))
   : value);
 
+// Conservative bounding longitudes for the same 25 km spherical distance used
+// below. Keep every longitude when the circle reaches a pole; split at ±180°.
+export function longitudeRanges({lat,lng}) {
+  const radians = Math.PI / 180, radius = 25 / 6371, margin = 1e-9;
+  if (Math.abs(lat) * radians + radius >= Math.PI / 2 - margin) return [[-180,180]];
+  const delta = Math.asin(Math.min(1,Math.sin(radius) / Math.cos(lat * radians))) / radians + margin;
+  const west = lng - delta, east = lng + delta;
+  if (west <= -180) return [[-180,east],[west+360,180]];
+  if (east >= 180) return [[west,180],[-180,east-360]];
+  return [[west,east]];
+}
+
 /** Account IDs are supplied only by the authenticated HTTP boundary, never from a request body. */
 export class ProductionStore {
   constructor({ db, clock = Date.now, moderators = [], maxPosts = 10000, maxMessages = 200, maxIntents = 2000,
@@ -126,9 +138,8 @@ export class ProductionStore {
     for (const userId of changedUsers) for (const fn of this.privateListeners) { try { fn(userId); } catch { /* The write is already committed. */ } }
     return result;
   }
-  sweep() {
+  sweep(now = this.clock()) {
     return this.transaction(() => {
-      const now = this.clock();
       const expired = this.db.prepare('UPDATE app_posts SET expired=1 WHERE expires_at<=? AND expired=0').run(now).changes;
       this.db.prepare('DELETE FROM app_posts WHERE retain_until<=?').run(now);
       this.db.prepare('DELETE FROM app_threads WHERE expires_at<=?').run(now);
@@ -182,17 +193,26 @@ export class ProductionStore {
   }
   postRow(id) { const row = this.db.prepare('SELECT * FROM app_posts WHERE id=? AND retain_until>?').get(id,this.clock()); if (!row) fail(404,'post_not_found'); return row; }
   livePost(id) { const row = this.postRow(id); if (row.expires_at <= this.clock()) fail(410,'post_expired'); return row; }
-  state({ cityId='2988507', point, mine=false, kind='all', role='all', zone='all', english=false, vehicle=false, sort='recent' }={}, userId=null) {
+  // Only retain this reader for one synchronous fan-out. It does not cache rows
+  // or bypass the cleanup required before that batch begins.
+  snapshotReader() {
+    const now = this.clock();
+    this.sweep(now);
+    return (scope={},userId=null) => this.#stateAt(scope,userId,now);
+  }
+  state(scope={},userId=null) { return this.snapshotReader()(scope,userId); }
+  #stateAt({ cityId='2988507', point, mine=false, kind='all', role='all', zone='all', english=false, vehicle=false, sort='recent' }={}, userId=null, now) {
     if(!['all','available','need'].includes(kind) || (role!=='all'&&!ROLES.includes(role)) ||
       (zone!=='all'&&!ZONES.some(item=>item.id===zone)) || typeof english!=='boolean' || typeof vehicle!=='boolean' ||
       !['recent','oldest'].includes(sort)) fail(400,'invalid_scope');
-    this.sweep();
     const { point: origin } = pointForLocation(cityId,point);
     if (mine) this.actor(userId);
-    const rows = mine ? this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 201').all(userId,this.clock())
+    const ranges = longitudeRanges(origin);
+    const rows = mine ? this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 201').all(userId,now)
       : this.db.prepare(`SELECT data FROM app_posts p WHERE expired=0 AND lat BETWEEN ? AND ? AND expires_at>?
+          AND (${ranges.map(()=> 'lng BETWEEN ? AND ?').join(' OR ')})
           AND NOT EXISTS(SELECT 1 FROM app_blocks b WHERE b.blocker_id=? AND b.blocked_id=p.owner_id)
-          ORDER BY expires_at DESC`).all(origin.lat-0.23,origin.lat+0.23,this.clock(),userId);
+          ORDER BY expires_at DESC`).all(origin.lat-0.23,origin.lat+0.23,now,...ranges.flat(),userId);
     const local = rows.map(parse).filter(post => mine || (post.status==='open' && distanceKm(origin,post)<=25));
     const active=local.filter(post=>post.status==='open');
     const counts={all:active.length,available:active.filter(post=>post.kind==='available').length,need:active.filter(post=>post.kind==='need').length};
@@ -202,9 +222,9 @@ export class ProductionStore {
       (zone==='all'||post.zoneId===zone)&&(!english||post.english)&&(!vehicle||post.vehicle))
       .sort((a,b)=>(sort==='oldest'?a.createdAt-b.createdAt:b.createdAt-a.createdAt)||a.id.localeCompare(b.id));
     const meta=this.db.prepare('SELECT epoch,version FROM app_meta WHERE id=1').get();
-    return { posts:candidates.slice(0,200).map(publicPost), now:this.clock(), mode:'production', ...meta,
+    return { posts:candidates.slice(0,200).map(publicPost), now, mode:'production', ...meta,
       scope:JSON.stringify({cityId,point:point??null,mine,kind,role,zone,english,vehicle,sort}), total:candidates.length, counts, truncated:candidates.length>200,
-      ...(userId?{feedRevision:this.feedRevision(userId),ownedPostIds:this.ownership(userId),ownedPosts:this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 10').all(userId,this.clock()).map(parse).map(publicPost)}:{}) };
+      ...(userId?{feedRevision:this.feedRevision(userId),ownedPostIds:this.db.prepare('SELECT id FROM app_posts WHERE owner_id=? AND expires_at>?').all(userId,now).map(row=>row.id),ownedPosts:this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 10').all(userId,now).map(parse).map(publicPost)}:{}) };
   }
   getPublicPost(id, userId=null) {
     const row=this.postRow(id);

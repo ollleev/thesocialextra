@@ -168,6 +168,63 @@ test('SSE is scoped, private changes remain private, and revoked/expired session
   const guestStream=await f.stream('/api/events',guest.cookie);await guestStream.next();f.advance(30*24*3600_000);assert.equal((await guestStream.next()).event,'session-expired');
 });
 
+test('one SSE batch sweeps once and shares serialized frames only for an exact reader and complete scope',async t=>{
+  const f=await fixture(t,{sweepIntervalMs:60000,heartbeatIntervalMs:60000,maxStreamsPerIp:12});
+  const owner=await f.register('batch_owner'),reader=await f.register('batch_reader'),other=await f.register('batch_other');
+  const login=await f.request('/api/auth/login',{method:'POST',body:{username:'batch_reader',password:PASSWORD}});assert.equal(login.status,200);
+  const publicPost=f.app.store.create(owner.data.user.id,input(),key()).post;
+  const own=f.app.store.create(reader.data.user.id,input({role:'Plongeur',english:true,vehicle:true}),key()).post;
+  const otherPost=f.app.store.create(other.data.user.id,input(),key()).post;
+  f.app.store.blockPost(reader.data.user.id,publicPost.id);
+  const specifications=[['',null],['',null],['',reader.cookie],['',login.cookie],['',other.cookie],
+    ['?kind=need&role=Plongeur&english=true&vehicle=true&sort=oldest',reader.cookie],['?mine=true',reader.cookie],
+    ['?cityId=2643743',null],['?lat=48.87&lng=2.36',reader.cookie]];
+  const streams=[];for(const [query,cookie] of specifications){const stream=await f.stream('/api/events'+query,cookie);await stream.next();streams.push(stream);}
+  let sweeps=0,readers=0,calculations=0,serializations=0;
+  const originalSweep=f.app.store.sweep.bind(f.app.store),originalReader=f.app.store.snapshotReader.bind(f.app.store);
+  f.app.store.sweep=now=>{sweeps++;return originalSweep(now);};
+  f.app.store.snapshotReader=()=>{readers++;const read=originalReader();return (...args)=>{
+    calculations++;const snapshot=read(...args);Object.defineProperty(snapshot,'toJSON',{value:()=>{serializations++;return snapshot;}});return snapshot;
+  };};
+  f.app.store.mutate(owner.data.user.id,publicPost.id,{action:'fill'},key());
+  const first=await Promise.all(streams.map(stream=>stream.next()));
+  assert.deepEqual({sweeps,readers,calculations,serializations},{sweeps:1,readers:1,calculations:7,serializations:7});
+  assert.deepEqual(first[0].data,first[1].data);assert.deepEqual(first[2].data,first[3].data);
+  assert.ok(first[0].data.posts.some(p=>p.id===publicPost.id));assert.equal('ownedPosts' in first[0].data,false);
+  assert.ok(first[2].data.posts.every(p=>p.id!==publicPost.id));assert.deepEqual(first[2].data.ownedPostIds,[own.id]);
+  assert.deepEqual(first[4].data.ownedPostIds,[otherPost.id]);assert.ok(first[4].data.posts.some(p=>p.id===publicPost.id));
+  assert.deepEqual(first[5].data.posts.map(p=>p.id),[own.id]);assert.deepEqual(first[6].data.posts.map(p=>p.id),[own.id]);
+  assert.equal(first[7].data.posts.length,0);assert.notEqual(first[8].data.scope,first[2].data.scope);
+  sweeps=readers=calculations=serializations=0;
+  f.app.store.mutate(owner.data.user.id,publicPost.id,{action:'close'},key());
+  const second=await Promise.all(streams.map(stream=>stream.next()));
+  assert.deepEqual({sweeps,readers,calculations,serializations},{sweeps:1,readers:1,calculations:7,serializations:7});
+  assert.equal(second[0].data.version,first[0].data.version+1);assert.ok(second[0].data.posts.every(p=>p.id!==publicPost.id));
+});
+
+test('an SSE frame cached for one session is not sent to another session revoked before its turn',async t=>{
+  const f=await fixture(t,{sweepIntervalMs:60000,heartbeatIntervalMs:60000}),reader=await f.register('batch_revoke');
+  const login=await f.request('/api/auth/login',{method:'POST',body:{username:'batch_revoke',password:PASSWORD}});assert.equal(login.status,200);
+  const post=f.app.store.create(reader.data.user.id,input(),key()).post;
+  const first=await f.stream('/api/events',reader.cookie),second=await f.stream('/api/events',login.cookie);await first.next();await second.next();
+  let calculations=0;const original=f.app.store.snapshotReader.bind(f.app.store);
+  f.app.store.snapshotReader=()=>{const read=original();return (...args)=>{calculations++;const snapshot=read(...args);f.app.auth.logout(login.cookie.split('=')[1]);return snapshot;};};
+  f.app.store.mutate(reader.data.user.id,post.id,{action:'fill'},key());
+  assert.equal((await first.next()).event,'state');assert.equal((await second.next()).event,'session-expired');assert.equal(calculations,1);
+});
+
+test('a session that expires during snapshot calculation receives no computed state',async t=>{
+  const f=await fixture(t,{sweepIntervalMs:60000,heartbeatIntervalMs:60000}),reader=await f.register('batch_expiring');
+  const login=await f.request('/api/auth/login',{method:'POST',body:{username:'batch_expiring',password:PASSWORD}});assert.equal(login.status,200);
+  const post=f.app.store.create(reader.data.user.id,input(),key()).post,stream=await f.stream('/api/events',reader.cookie);await stream.next();
+  const cached=await f.stream('/api/events',login.cookie);await cached.next();
+  let calculations=0;const original=f.app.store.snapshotReader.bind(f.app.store);
+  f.app.store.snapshotReader=()=>{const read=original();return (...args)=>{calculations++;const snapshot=read(...args);f.advance(30*24*3600_000);return snapshot;};};
+  f.app.store.mutate(reader.data.user.id,post.id,{action:'fill'},key());
+  assert.equal((await stream.next()).event,'session-expired');assert.equal(stream.frames.length,0);
+  assert.equal((await cached.next()).event,'session-expired');assert.equal(cached.frames.length,0);assert.equal(calculations,1);
+});
+
 test('public-author block HTTP contracts expose no account identity and remain manageable after expiry',async t=>{
   const f=await fixture(t),owner=await f.register('public_block_owner'),reader=await f.register('public_block_reader'),other=await f.register('public_block_other');
   const post=f.app.store.create(owner.data.user.id,input(),key()).post,route=`/api/posts/${post.id}/block`;
@@ -210,8 +267,11 @@ test('private block invalidation reaches both reader sessions but neither anonym
   const one=await f.stream('/api/events',reader.cookie),two=await f.stream('/api/events',second.cookie),anonymous=await f.stream(),unrelated=await f.stream('/api/events',owner.cookie);
   for(const stream of [one,two,anonymous,unrelated])assert.equal((await stream.next()).data.posts.length,1);
   const before=f.app.store.state().version;
+  let batchReads=0,batchSnapshots=0;const originalReader=f.app.store.snapshotReader.bind(f.app.store);
+  f.app.store.snapshotReader=()=>{batchReads++;const read=originalReader();return (...args)=>{batchSnapshots++;return read(...args);};};
   const block=await f.request(`/api/posts/${post.id}/block`,{method:'POST',cookie:reader.cookie,body:{}});
   for(const stream of [one,two]) {const snapshot=(await stream.next()).data;assert.equal(snapshot.posts.length,0);assert.equal(snapshot.feedRevision,1);assert.equal(snapshot.version,before);}
+  assert.equal(batchReads,1);assert.equal(batchSnapshots,1);
   await new Promise(resolve=>setTimeout(resolve,50));assert.equal(anonymous.frames.length,0);assert.equal(unrelated.frames.length,0);assert.equal(f.app.store.state().version,before);
   await f.request(`/api/posts/${post.id}/block`,{method:'POST',cookie:reader.cookie,body:{}});
   await new Promise(resolve=>setTimeout(resolve,50));assert.equal(one.frames.length,0);assert.equal(two.frames.length,0);
