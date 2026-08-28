@@ -661,15 +661,23 @@ $('#use-location').addEventListener('click', () => {
   }, () => { button.disabled = false; if (request === cityRequest) $('#location-status').textContent = 'Localisation refusée ou indisponible. La recherche par ville reste accessible.'; }, { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 });
 });
 
+function openAccountLink() {
+  const values = new URL(location.href).searchParams.getAll('account');
+  if (values.length !== 1 || values[0] !== 'delete') return false;
+  accounts.showDeletion();
+  return true;
+}
 async function start() {
+  let deletionLink = false;
   try {
-    await accounts.refresh();
+    try { await accounts.refresh(); }
+    finally { deletionLink = openAccountLink(); }
     const [zones, roleGroups] = await Promise.all([api('/api/zones'), api('/api/roles')]); state.zones = zones;
     state.roles = roleGroups.flatMap(group => group.roles);
     const options = zones.map(zone => `<option value="${esc(zone.id)}">${esc(zone.label)}</option>`).join(''); $('#zone-filter').insertAdjacentHTML('beforeend', options); $('#form-zone').innerHTML = options;
     const roleOptions = roleGroups.map(group => `<optgroup label="${esc(group.label)}">${group.roles.map(role => `<option value="${esc(role)}">${esc(role)}</option>`).join('')}</optgroup>`).join('');
     $('#role-filter').insertAdjacentHTML('beforeend', roleOptions); $('#form-role').insertAdjacentHTML('beforeend', roleOptions);
-    const shared = parseFeedLink(location.href, state.roles), requested = shared.postId;
+    const shared = parseFeedLink(deletionLink ? new URL('/', location.href).href : location.href, state.roles), requested = shared.postId;
     function linkNotice(message) { $('#feed-link-notice').textContent = message; $('#feed-link-notice').hidden = false; }
     if (shared.invalid) linkNotice('Certains filtres de ce lien sont invalides et ont été ignorés.');
     let linkedPost;

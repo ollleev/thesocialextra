@@ -26,7 +26,7 @@ Ouvrir ensuite l’adresse locale 4179. HTTP est autorisé uniquement en mode lo
 
 ## Fonctionnement
 
-- Consultation libre ; pseudo et phrase secrète pour publier et échanger. Code de secours, sessions révocables et suppression de compte.
+- Consultation libre ; pseudo et phrase secrète pour publier et échanger. Code de secours, sessions révocables et suppression de compte accessible depuis le web.
 - Annonces visibles 30 min, 1 h, 2 h ou 4 h. Places confirmées manuellement ; un message ne réserve rien. Les annonces pourvues quittent le fil.
 - Douze métiers, carte et fil, recherche par ville et localisation approximative facultative. Catalogue GeoNames de grandes localités, non exhaustif.
 - Conversations privées, messages texte et vocaux facultatifs, blocage et signalements. Conservation jusqu’à sept jours après expiration publique, sauf suppression ou modération.

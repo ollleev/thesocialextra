@@ -49,6 +49,24 @@ test('production requires canonical HTTPS and local HTTP requires explicit loopb
   const r=await f.register('local_user');assert.match(r.cookie,/^extra_session=/);assert.doesNotMatch(r.headers['set-cookie'][0],/; Secure/);
 });
 
+test('the public deletion page and account link are readable without authentication and never delete on GET',async t=>{
+  const f=await fixture(t),registered=await f.register('deletion_page_user');
+  const page=await f.request('/delete-account.html');
+  assert.equal(page.status,200);assert.match(page.headers['content-type'],/^text\/html/);
+  assert.match(page.text,/<title>Supprimer votre compte — thesocialextra<\/title>/);
+  assert.match(page.text,/href="\/\?account=delete"/);assert.doesNotMatch(page.text,/<script\b|<form\b/i);
+  assert.match(page.text,/base active/);assert.match(page.text,/sauvegardes/);assert.match(page.text,/restent à valider/);
+  const privacy=await f.request('/privacy.html');assert.match(privacy.text,/href="\/delete-account\.html"/);
+  for(const cookie of [undefined,registered.cookie]) {
+    const form=await f.request('/?account=delete',{cookie});assert.equal(form.status,200);
+    assert.match(form.text,/<input id="delete-confirm" type="checkbox" required>/);
+    assert.match(form.text,/id="delete-password"[^>]+required/);
+    assert.match(form.text,/id="cancel-delete-account" type="button"/);
+  }
+  assert.equal((await f.request('/api/session',{cookie:registered.cookie})).data.user.id,registered.data.user.id);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,1);
+});
+
 test('cookie-only sessions expose no tokens, validate strictly, and enforce origin and host',async t=>{
   const f=await fixture(t),r=await f.register('COOKIE_USER');
   assert.deepEqual(Object.keys(r.data).sort(),['recoveryCode','user']);assert.equal(r.data.user.username,'cookie_user');

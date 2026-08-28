@@ -14,6 +14,7 @@
   <script src="/app.js" type="module"></script>
 </head>
 <body>
+
   <a class="skip-link" href="#main">Aller aux annonces</a>
   <header class="header">
     <a class="brand" href="/" aria-label="thesocialextra, accueil">thesocialextra<span>.</span><span class="brand-wave" aria-hidden="true"></span></a>
@@ -103,7 +104,7 @@
     </form></div>
     <div id="account-signed-in" hidden><p class="account-explanation">Vos annonces et conversations sont liées à ce compte. Vous pouvez les retrouver sur un autre appareil.</p>
       <button class="button outline" id="moderation-button" hidden>Ouvrir les signalements</button><button class="button outline" id="logout">Se déconnecter</button>
-      <details class="delete-account"><summary>Supprimer mon compte</summary><p>Cette action supprime vos annonces et les conversations auxquelles vous participez. Elle est irréversible.</p><form id="delete-account-form"><label class="field-label" for="delete-password">Confirmez votre phrase secrète<input id="delete-password" type="password" autocomplete="current-password" required></label><label class="consent"><input type="checkbox" required>Je confirme la suppression du compte et de ses données.</label><button class="button danger" type="submit">Supprimer définitivement</button></form></details>
+      <details id="delete-account-details" class="delete-account"><summary>Supprimer mon compte</summary><p>Cette action supprime votre compte, vos annonces, vos conversations (texte et vocaux) et les signalements associés de la base active. Elle est irréversible. <a href="/delete-account.html" target="_blank" rel="noopener">Détails et limites concernant les sauvegardes</a>.</p><form id="delete-account-form"><label class="field-label" for="delete-password">Confirmez votre phrase secrète<input id="delete-password" type="password" autocomplete="current-password" maxlength="256" required></label><label class="consent"><input id="delete-confirm" type="checkbox" required>Je confirme la suppression du compte et de ses données.</label><button class="button danger" type="submit">Supprimer définitivement</button><button class="button outline" id="cancel-delete-account" type="button">Annuler</button></form></details>
     </div><p id="account-error" class="form-error" role="alert" hidden></p>
   </div></dialog>
 </body>

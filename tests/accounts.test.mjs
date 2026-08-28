@@ -37,11 +37,12 @@ function fixture(t, { onChange } = {}) {
   const ids = ['account', 'account-signed-in', 'account-auth', 'account-recovery', 'account-error', 'account-title', 'account-description',
     'account-username-field', 'account-username', 'account-code-field', 'account-code', 'account-password', 'account-password-label',
     'account-password-help', 'account-submit', 'account-consent', 'account-terms', 'account-form', 'recovery-code', 'delete-password',
-    'recovery-saved', 'account-close', 'copy-recovery', 'recovery-copy-status', 'recovery-form', 'logout', 'delete-account-form'];
+    'recovery-saved', 'account-close', 'copy-recovery', 'recovery-copy-status', 'recovery-form', 'logout', 'delete-account-form',
+    'delete-account-details', 'delete-confirm', 'cancel-delete-account'];
   const nodes = new Map(ids.map(id => [id, new Element(id)]));
   const get = id => { assert.ok(nodes.has(id), `Unexpected DOM lookup: ${id}`); return nodes.get(id); };
   const modes = ['register', 'login', 'recover'].map(mode => { const button = new Element(`mode-${mode}`); button.dataset.authMode = mode; return button; });
-  const buttons = [...modes, ...['account-close', 'account-submit', 'copy-recovery', 'logout'].map(get), new Element('recovery-submit'), new Element('delete-submit')];
+  const buttons = [...modes, ...['account-close', 'account-submit', 'copy-recovery', 'logout', 'cancel-delete-account'].map(get), new Element('recovery-submit'), new Element('delete-submit')];
   const dialog = get('account');
   dialog.querySelector = selector => get(selector.slice(1));
   dialog.querySelectorAll = selector => {
@@ -54,6 +55,7 @@ function fixture(t, { onChange } = {}) {
     for (const id of ['account-username', 'account-code', 'account-password']) get(id).value = '';
     get('account-terms').checked = false;
   };
+  get('delete-account-form').reset = () => { get('delete-password').value = ''; get('delete-confirm').checked = false; };
   const descriptors = new Map(['document', 'fetch'].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   const calls = [], queued = [], waiters = [], unsettled = new Set();
   let failReads = false;
@@ -93,7 +95,7 @@ function fixture(t, { onChange } = {}) {
       if (descriptor) Object.defineProperty(globalThis, name, descriptor); else delete globalThis[name];
     }
   });
-  return { ui, get, calls, applied, buttons, next, initialize, fill, failReads: () => { failReads = true; } };
+  return { ui, get, calls, applied, buttons, modes, next, initialize, fill, failReads: () => { failReads = true; } };
 }
 
 test('concurrent session reads resolved in reverse order apply only the newest result', async t => {
@@ -108,7 +110,7 @@ test('concurrent session reads resolved in reverse order apply only the newest r
 
 for (const action of ['logout', 'delete']) test(`${action} confirmation clears identity even when subsequent session reads are unavailable`, async t => {
   const f = fixture(t); await f.initialize(USER); f.ui.show();
-  f.get('delete-password').value = PASSWORD;
+  f.get('delete-password').value = PASSWORD; f.get('delete-confirm').checked = true;
   f.failReads();
   const operation = f.get(action === 'logout' ? 'logout' : 'delete-account-form').fire(action === 'logout' ? 'click' : 'submit');
   const request = await f.next(action === 'logout' ? '/api/auth/logout' : '/api/account');
@@ -168,7 +170,7 @@ test('a session read begun before a successful login cannot overwrite the confir
 for (const action of ['login', 'delete']) test(`a late session read does not apply while ${action} is still busy`, async t => {
   const f = fixture(t); await f.initialize(action === 'login' ? null : USER);
   const old = f.ui.refresh(), oldRequest = await f.next('/api/session');
-  if (action === 'login') f.fill('login'); else { f.ui.show(); f.get('delete-password').value = PASSWORD; }
+  if (action === 'login') f.fill('login'); else { f.ui.show(); f.get('delete-password').value = PASSWORD; f.get('delete-confirm').checked = true; }
   const target = f.get(action === 'login' ? 'account-form' : 'delete-account-form');
   const operation = target.fire('submit');
   const request = await f.next(action === 'login' ? '/api/auth/login' : '/api/account');
@@ -184,4 +186,64 @@ for (const action of ['login', 'delete']) test(`a late session read does not app
   assert.deepEqual(during, []);
   assert.deepEqual(f.ui.session.user, action === 'login' ? USER : null);
   assert.ok(f.buttons.every(button => !button.disabled));
+});
+
+test('anonymous deletion access opens login, never registration, and never sends a deletion',async t=>{
+  const f=fixture(t);await f.initialize(null);f.ui.showDeletion();
+  assert.equal(f.get('account').open,true);assert.equal(f.get('account-submit').textContent,'Se connecter');
+  assert.equal(f.get('account-username').focused,true);assert.equal(f.get('account-signed-in').hidden,true);
+  assert.equal(f.modes.find(button=>button.dataset.authMode==='register').hidden,true);
+  f.get('delete-password').value=PASSWORD;f.get('delete-confirm').checked=true;
+  await f.get('delete-account-form').fire('submit');
+  assert.equal(f.calls.some(call=>call.method==='DELETE'),false);
+  f.get('account').close();assert.equal(f.get('delete-confirm').checked,false);
+  f.ui.show('register');assert.equal(f.get('account-submit').textContent,'Créer mon compte gratuit');
+  assert.equal(f.modes.find(button=>button.dataset.authMode==='register').hidden,false);
+});
+
+for(const readFails of [false,true])test(`login continues to explicit deletion even when the follow-up read ${readFails?'fails':'succeeds'}`,async t=>{
+  const f=fixture(t);await f.initialize(null);f.ui.showDeletion();if(readFails)f.failReads();
+  f.get('account-username').value=USER.username;f.get('account-password').value=PASSWORD;
+  const operation=f.get('account-form').fire('submit');
+  (await f.next('/api/auth/login')).respond({user:USER});
+  if(!readFails)(await f.next('/api/session')).respond(session(USER));
+  await operation;
+  assert.equal(f.get('account').open,true);assert.equal(f.get('account-auth').hidden,true);
+  assert.equal(f.get('delete-account-details').open,true);assert.equal(f.get('delete-password').focused,true);
+  assert.equal(f.get('delete-password').value,'');assert.equal(f.get('delete-confirm').checked,false);
+  assert.equal(f.calls.some(call=>call.method==='DELETE'),false);
+  // A queued native close event from the login dialog must not erase the
+  // newly opened deletion form or its explicit input.
+  f.get('delete-password').value=PASSWORD;await f.get('account').fire('close');
+  assert.equal(f.get('delete-password').value,PASSWORD);
+});
+
+test('recovery preserves the new one-time code before continuing to the deletion form',async t=>{
+  const f=fixture(t);await f.initialize(null);f.ui.showDeletion();
+  await f.modes.find(button=>button.dataset.authMode==='recover').fire('click');
+  f.get('account-code').value='a'.repeat(64);f.get('account-password').value=PASSWORD;
+  const operation=f.get('account-form').fire('submit');
+  (await f.next('/api/auth/recover')).respond({user:USER,recoveryCode:'b'.repeat(64)});
+  (await f.next('/api/session')).respond(session(USER));await operation;
+  assert.equal(f.get('account-recovery').hidden,false);assert.equal(f.get('delete-account-details').open,false);
+  assert.equal(f.get('recovery-code').value,'b'.repeat(64));assert.equal(f.calls.some(call=>call.method==='DELETE'),false);
+  f.get('recovery-saved').checked=true;await f.get('recovery-form').fire('submit');
+  assert.equal(f.get('recovery-code').value,'');assert.equal(f.get('delete-account-details').open,true);
+  assert.equal(f.get('delete-password').focused,true);assert.equal(f.get('delete-password').value,'');
+  assert.equal(f.calls.some(call=>call.method==='DELETE'),false);
+});
+
+test('cancelling deletion clears confirmation; only a new explicit password and confirmation can delete',async t=>{
+  const f=fixture(t);await f.initialize(USER);f.ui.showDeletion();
+  f.get('delete-password').value=PASSWORD;f.get('delete-confirm').checked=true;
+  await f.get('cancel-delete-account').fire('click');
+  assert.equal(f.get('account').open,false);assert.equal(f.get('delete-password').value,'');assert.equal(f.get('delete-confirm').checked,false);
+  assert.equal(f.calls.some(call=>call.method==='DELETE'),false);
+  f.ui.showDeletion();await f.get('delete-account-form').fire('submit');
+  f.get('delete-password').value=PASSWORD;await f.get('delete-account-form').fire('submit');
+  assert.equal(f.calls.some(call=>call.method==='DELETE'),false);
+  f.get('delete-confirm').checked=true;const operation=f.get('delete-account-form').fire('submit');
+  const request=await f.next('/api/account');assert.equal(request.options.method,'DELETE');assert.deepEqual(JSON.parse(request.options.body),{password:PASSWORD});
+  request.respond({},204);await operation;
+  assert.equal(f.calls.filter(call=>call.method==='DELETE').length,1);assert.equal(f.ui.session.user,null);
 });

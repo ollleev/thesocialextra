@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { MessageOutbox, requestJSON } from '../public/requests.js';
 
 test('drafts and delayed send results are isolated by conversation and edit version', () => {
@@ -66,4 +68,35 @@ test('JSON requests carry private authorization and intent only in headers, pres
       return { status: 409, ok: false, json: async () => ({ error: 'idempotency_conflict' }) };
     },
   }), { code: 'idempotency_conflict', status: 409 });
+});
+
+const appSource=readFileSync(new URL('../public/app.js',import.meta.url),'utf8');
+const accountStartup=appSource.slice(appSource.indexOf('function openAccountLink()'),appSource.lastIndexOf('\nstart();'));
+function accountStartupFixture(query,{sessionFails=false,feedFails=false}={}) {
+  const calls=[],nodes=new Map();let parsedURL;
+  const context=vm.createContext({URL,location:{href:`https://extras.test/${query}`},state:{},
+    accounts:{async refresh(){calls.push('session');if(sessionFails)throw new Error('session unavailable');},showDeletion(){calls.push('deletion form');}},
+    async api(path){calls.push(path);if(feedFails)throw new Error('feed unavailable');return [];},
+    $:id=>{if(!nodes.has(id))nodes.set(id,{insertAdjacentHTML(){},addEventListener(){}});return nodes.get(id);},
+    parseFeedLink(url){parsedURL=url;throw new Error('stop after routing');},
+    setConnection(){},icon:()=>'',esc:value=>value,errorText:()=> 'Unavailable',
+  });
+  vm.runInContext(accountStartup,context);
+  return {context,calls,parsedURL:()=>parsedURL};
+}
+
+test('only one exact account=delete value opens a deletion form; other URL values have no effect',()=>{
+  for(const query of ['','?account=DELETE','?account=delete%20','?account=register','?account=delete&account=delete','?account=other&account=delete']) {
+    const f=accountStartupFixture(query);assert.equal(f.context.openAccountLink(),false);assert.deepEqual(f.calls,[]);
+  }
+  const f=accountStartupFixture('?account=delete');assert.equal(f.context.openAccountLink(),true);assert.deepEqual(f.calls,['deletion form']);
+});
+
+test('account deletion access precedes the feed, survives outages, and takes precedence over a post link',async()=>{
+  for(const options of [{sessionFails:true},{feedFails:true},{}]) {
+    const f=accountStartupFixture('?account=delete&post=synthetic-post',options);await f.context.start();
+    assert.deepEqual(f.calls.slice(0,2),['session','deletion form']);
+    if(options.sessionFails)assert.equal(f.calls.length,2);
+    if(!options.sessionFails&&!options.feedFails)assert.equal(f.parsedURL(),'https://extras.test/');
+  }
 });

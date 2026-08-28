@@ -51,3 +51,9 @@ Entrées : WebM, Ogg ou MP4, 5 Mio maximum. Sortie : Opus mono, 512 Kio maximum 
 Quotas du pilote : 20 vocaux par discussion, 20 Mio par expéditeur, 200 Mio de vocaux actifs au total et 50 Mio de copies vocales dans les signalements. Ces plafonds ne constituent pas une mesure de charge. Les copies des preuves suivent la conservation de 30 jours et l’effacement du compte concerné ; elles peuvent survivre à un retrait par modération. Une capacité insuffisante refuse le nouveau signalement sans supprimer les preuves antérieures. Prévoir un canal de recours humain distinct.
 
 Le micro n’est demandé qu’après un clic. Aucun enregistrement n’est envoyé automatiquement ; il peut être réécouté et effacé. Le texte reste disponible si le navigateur ne permet pas l’enregistrement ou la lecture. Les navigateurs et appareils ciblés doivent être testés réellement avant diffusion.
+
+## Suppression depuis le web et sauvegarde planifiée
+
+La page `/delete-account.html` propose un chemin vers le formulaire de compte sans installation mobile. Un lien ne supprime jamais le compte : connexion ou récupération, phrase secrète et confirmation restent nécessaires. La politique de sauvegarde doit expliquer les limites de cet effacement.
+
+Le modèle de job quotidien et ses limites sont détaillés dans [BACKUP.md](BACKUP.md). Il vérifie une restauration avant de publier un point chiffré et refuse une capacité insuffisante avant la copie, journal WAL compris. Ne pas confondre un timer local avec un transfert hors machine ou un dispositif d’alerte.

@@ -1,5 +1,5 @@
 import { DatabaseSync, backup } from 'node:sqlite';
-import { mkdirSync, chmodSync, existsSync, lstatSync } from 'node:fs';
+import { mkdirSync, chmodSync, existsSync, lstatSync, openSync, closeSync } from 'node:fs';
 import path from 'node:path';
 
 export function openDatabase(filename) {
@@ -17,6 +17,9 @@ export function openDatabase(filename) {
 export async function backupDatabase(db, destination) {
   if (!path.isAbsolute(destination) || existsSync(destination)) throw new Error('Backup requires a new absolute destination');
   mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+  // Reserve the new destination atomically and privately before SQLite writes
+  // any plaintext, rather than correcting its mode only after the copy.
+  closeSync(openSync(destination, 'wx', 0o600));
   await backup(db, destination);
   chmodSync(destination, 0o600);
   const check = new DatabaseSync(destination, { readOnly: true });

@@ -12,6 +12,7 @@ export function createAccountUI({ openDialog, onChange, onError }) {
     recover: ['Retrouver votre compte.', 'Utilisez le code de secours reçu à la création du compte.', 'Récupérer mon compte'],
   };
   function render(next = mode) {
+    if (resume === showDeletion && next === 'register') next = 'login';
     mode = next;
     const signedIn = Boolean(session.user);
     $('#account-signed-in').hidden = !signedIn;
@@ -33,12 +34,25 @@ export function createAccountUI({ openDialog, onChange, onError }) {
     $('#account-consent').hidden = mode !== 'register';
     $('#account-terms').required = mode === 'register';
     dialog.querySelectorAll('[data-auth-mode]').forEach(button => {
+      button.hidden = resume === showDeletion && button.dataset.authMode === 'register';
       button.classList.toggle('active', button.dataset.authMode === mode);
       button.setAttribute('aria-pressed', String(button.dataset.authMode === mode));
     });
   }
   function show(next = 'login', continuation) {
-    resume = continuation; $('#account-form').reset(); render(next); openDialog(dialog);
+    resume = continuation; $('#account-form').reset(); $('#delete-account-form').reset(); $('#delete-account-details').open = false;
+    render(next); openDialog(dialog);
+  }
+  function showDeletion() {
+    show('login', showDeletion);
+    if (session.user) {
+      resume = undefined;
+      $('#delete-account-details').open = true;
+      $('#delete-password').focus();
+    } else {
+      $('#account-description').textContent = 'Connectez-vous au compte thesocialextra à supprimer. Rien ne sera effacé avant votre confirmation.';
+      $('#account-username').focus();
+    }
   }
   async function refresh() {
     const revision=++readRevision;let next;
@@ -64,7 +78,13 @@ export function createAccountUI({ openDialog, onChange, onError }) {
   }
   dialog.addEventListener('cancel', event => { if (busy || !$('#account-recovery').hidden) event.preventDefault(); });
   dialog.addEventListener('click',event=>{if(event.target===dialog&&(busy||!$('#account-recovery').hidden))event.stopImmediatePropagation();},true);
-  dialog.addEventListener('close', () => { $('#account-password').value = ''; $('#account-code').value = ''; $('#delete-password').value = ''; });
+  dialog.addEventListener('close', () => {
+    // Native close events may arrive after a continuation has reopened the dialog.
+    if (dialog.open) return;
+    resume = undefined; $('#account-password').value = ''; $('#account-code').value = '';
+    $('#delete-account-form').reset(); $('#delete-account-details').open = false;
+  });
+  $('#cancel-delete-account').addEventListener('click', () => { if (!busy) dialog.close(); });
   dialog.querySelectorAll('[data-auth-mode]').forEach(button => button.addEventListener('click', () => { if (!busy) render(button.dataset.authMode); }));
   $('#account-form').addEventListener('submit', async event => {
     event.preventDefault(); if (busy) return;
@@ -85,7 +105,8 @@ export function createAccountUI({ openDialog, onChange, onError }) {
       // Display the one-time recovery code before a follow-up read: a failed
       // session refresh must never discard a successfully issued recovery key.
       await applyAuthResult(result.user);
-      await refresh();
+      try { await refresh(); }
+      catch (error) { if (resume !== showDeletion || result.recoveryCode) throw error; }
       if (!result.recoveryCode) finish();
     } catch (error) { $('#account-error').textContent = onError(error); $('#account-error').hidden = false; }
     finally { setBusy(false); }
@@ -102,7 +123,7 @@ export function createAccountUI({ openDialog, onChange, onError }) {
     finally { setBusy(false); }
   });
   $('#delete-account-form').addEventListener('submit', async event => {
-    event.preventDefault(); if (busy) return; setBusy(true);++readRevision;
+    event.preventDefault(); if (busy || !session.user || !$('#delete-confirm').checked || !$('#delete-password').value) return; setBusy(true);++readRevision;
     try {
       await requestJSON('/api/account', { method: 'DELETE', body: { password: $('#delete-password').value } });
       await applyAuthResult(null); resume = undefined; dialog.close();
@@ -110,7 +131,7 @@ export function createAccountUI({ openDialog, onChange, onError }) {
     finally { setBusy(false); }
   });
   return {
-    refresh, show,
+    refresh, show, showDeletion,
     get session() { return session; },
     require(continuation) { if (session.mode !== 'production' || session.user) return true; show('register', continuation); return false; },
   };
