@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,rm,writeFile,readFile,stat,chmod,readdir,mkdir,symlink,realpath } from 'node:fs/promises';
+import { mkdtemp,rm,writeFile,readFile,stat,chmod,readdir,mkdir,symlink,realpath,open } from 'node:fs/promises';
 import childProcess,{spawn} from 'node:child_process';
 import {syncBuiltinESMExports} from 'node:module';
 import path from 'node:path';
@@ -298,4 +298,110 @@ test('pull CLI emits a bounded generic error without private config paths or par
   child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
   const code=await new Promise(resolve=>child.once('close',resolve));assert.equal(code,1);assert.equal(stdout,'');
   assert.deepEqual(JSON.parse(stderr),{ok:false,error:'invalid_pull_config'});assert.ok(!stderr.includes(f.dir));
+});
+
+const readerFile=new URL('../ops/backup-readonly.py',import.meta.url).pathname;
+const readerCommand=parameters=>`python3 -I - '${Buffer.from(JSON.stringify(parameters)).toString('base64')}'`;
+async function runReader(directory,command,{input='',keepInputOpen=false}={}){
+  const child=spawn('python3',['-I',readerFile,directory],{env:command===undefined?{}:{SSH_ORIGINAL_COMMAND:command},stdio:['pipe','pipe','pipe']});
+  const stdout=[],stderr=[];child.stdout.on('data',chunk=>stdout.push(chunk));child.stderr.on('data',chunk=>stderr.push(chunk));
+  child.stdin.on('error',()=>{});if(!keepInputOpen)child.stdin.end(input);
+  const timer=setTimeout(()=>child.kill('SIGKILL'),10000);
+  try{
+    const code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});
+    return {code,signal:child.signalCode,stdout:Buffer.concat(stdout),stderr:Buffer.concat(stderr)};
+  }finally{clearTimeout(timer);}
+}
+function readerRefused(result){assert.equal(result.code,1);assert.equal(result.signal,null);assert.equal(result.stdout.length,0);assert.equal(result.stderr.length,0);}
+async function readerFixture(t){
+  const f=await fixture(t),directory=path.join(await realpath(f.dir),'encrypted');await mkdir(directory,{mode:0o700});
+  const name=oldPoint,content=Buffer.alloc(131137,0x5a);await writeFile(path.join(directory,name),content,{mode:0o600});
+  return {...f,directory,entry:{name,bytes:content.length},content};
+}
+
+test('forced reader works with the real client list/read protocol and never executes incoming source',async t=>{
+  const f=await pullFixture(t),calls=[];
+  const transport=createSSHTransport(f.config,{spawnProcess(binary,args,options){
+    assert.equal(binary,'/usr/bin/ssh');assert.equal(options.shell,false);calls.push(args.at(-1));
+    return spawn('python3',['-I',readerFile,f.config.remoteDirectory],{...options,env:{SSH_ORIGINAL_COMMAND:args.at(-1)}});
+  }});
+  const signal=new AbortController().signal;assert.deepEqual(await transport.list({signal}),[f.entry]);
+  const chunks=[];for await(const chunk of transport.read(f.entry,{signal}))chunks.push(chunk);
+  assert.deepEqual(Buffer.concat(chunks),f.ciphertext);
+  const result=await f.pull({transport});assert.equal(result.restoredIntegrity,'ok');assert.equal(calls.length,4);
+  const marker=f.file('must-not-exist'),original=await readFile(path.join(f.config.remoteDirectory,f.entry.name));
+  const attempt=await runReader(f.config.remoteDirectory,readerCommand({directory:f.config.remoteDirectory,operation:'list'}),{
+    input:`import pathlib, sys\npathlib.Path(${JSON.stringify(marker)}).write_text('synthetic execution')\nsys.stdout.write('FORGED')\n`,
+  });
+  assert.equal(attempt.code,0);assert.equal(attempt.stderr.length,0);assert.deepEqual(JSON.parse(attempt.stdout),[f.entry]);
+  await assert.rejects(stat(marker),{code:'ENOENT'});
+  assert.deepEqual(await readFile(path.join(f.config.remoteDirectory,f.entry.name)),original);
+});
+
+test('forced reader rejects malformed commands, shell injection and non-strict JSON without diagnostics',async t=>{
+  const f=await readerFixture(t),parameters={directory:f.directory,operation:'list'},valid=readerCommand(parameters);
+  const encoded=raw=>`python3 -I - '${Buffer.from(raw).toString('base64')}'`;
+  const marker=f.file('injection-must-not-exist');
+  for(const command of [undefined,'','sh','internal-sftp',`python3 -c 'print(1)'`,valid+' extra',valid.replace(' -I ', ' '),
+    valid+`; touch '${marker}'`,valid+` && touch '${marker}'`,`${valid} $(touch '${marker}')`,
+    "python3 -I - '","python3 -I - '!!!!'",'x'.repeat(16385),
+    encoded('[]'),encoded('null'),encoded('{'),encoded(JSON.stringify({...parameters,extra:true})),
+    encoded(`{"directory":${JSON.stringify(f.directory)},"operation":"list","operation":"list"}`),
+    encoded(`{"directory":${JSON.stringify(f.directory)},"operation":"list","extra":NaN}`),
+  ])readerRefused(await runReader(f.directory,command));
+  await assert.rejects(stat(marker),{code:'ENOENT'});
+});
+
+test('forced reader fixes the directory and refuses traversal, keys, unknown fields and forged sizes',async t=>{
+  const f=await readerFixture(t),base={directory:f.directory,operation:'read',...f.entry};
+  await writeFile(f.file('synthetic-key'),Buffer.alloc(32,0x31),{mode:0o600});
+  const alternate=path.join(await realpath(f.dir),'alternate');await mkdir(alternate,{mode:0o700});
+  await writeFile(path.join(alternate,f.entry.name),f.content,{mode:0o600});
+  for(const parameters of [
+    {...base,directory:alternate},{...base,directory:f.directory+'/../alternate'}, {...base,directory:f.directory+'/'},
+    {...base,operation:'delete'}, {...base,operation:'list'}, {...base,extra:true},
+    {...base,name:'../synthetic-key'},{...base,name:f.file('synthetic-key')},{...base,name:'synthetic-key'},
+    {...base,name:'../encrypted/'+f.entry.name},{...base,name:f.entry.name.replace('08-01','02-30')},
+    {...base,name:f.entry.name+'\n'},{...base,name:[]}, {...base,bytes:f.entry.bytes-1}, {...base,bytes:f.entry.bytes+1},
+    {...base,bytes:36},{...base,bytes:35},{...base,bytes:2*1024**3+37},{...base,bytes:String(f.entry.bytes)},
+    {...base,bytes:true},{...base,bytes:null},{...base,bytes:1.5},
+  ])readerRefused(await runReader(f.directory,readerCommand(parameters)));
+  const success=await runReader(f.directory,readerCommand(base));assert.equal(success.code,0);assert.deepEqual(success.stdout,f.content);
+  assert.equal(success.stderr.length,0);assert.deepEqual(await readFile(f.file('synthetic-key')),Buffer.alloc(32,0x31));
+});
+
+test('forced reader rejects symlink components and only exposes private regular canonical archives',async t=>{
+  const f=await readerFixture(t),variant=day=>oldPoint.replace('08-01',`08-${day}`);
+  const linked=variant('02'),shared=variant('03'),directoryName=variant('04'),small=variant('05'),large=variant('06'),fifo=variant('07');
+  await writeFile(f.file('synthetic-key'),Buffer.alloc(64,0x32),{mode:0o600});
+  await symlink(f.file('synthetic-key'),path.join(f.directory,linked));await writeFile(path.join(f.directory,shared),f.content,{mode:0o644});
+  await mkdir(path.join(f.directory,directoryName),{mode:0o700});await writeFile(path.join(f.directory,small),Buffer.alloc(35),{mode:0o600});
+  const sparse=await open(path.join(f.directory,large),'wx',0o600);try{await sparse.truncate(2*1024**3+37);}finally{await sparse.close();}
+  const pipe=childProcess.spawnSync('python3',['-I','-c','import os, sys; os.mkfifo(sys.argv[1], 0o600)',path.join(f.directory,fifo)]);
+  assert.equal(pipe.status,0);
+  await writeFile(path.join(f.directory,'foreign.tseb'),f.content,{mode:0o600});
+  await writeFile(path.join(f.directory,oldPoint.replace('08-01','02-30')),f.content,{mode:0o600});
+  const list=()=>runReader(f.directory,readerCommand({directory:f.directory,operation:'list'}));
+  const result=await list();assert.equal(result.code,0);assert.deepEqual(JSON.parse(result.stdout),[f.entry]);assert.equal(result.stderr.length,0);
+  for(const name of [linked,shared,directoryName,small,large,fifo])readerRefused(await runReader(f.directory,readerCommand({directory:f.directory,operation:'read',name,bytes:f.entry.bytes})));
+  const parent=await realpath(f.dir),finalLink=path.join(parent,'linked-directory'),ancestor=path.join(parent,'linked-parent');
+  await symlink(f.directory,finalLink);await symlink(parent,ancestor);
+  for(const directory of [finalLink,path.join(ancestor,'encrypted')])readerRefused(await runReader(directory,readerCommand({directory,operation:'list'})));
+  await chmod(f.directory,0o750);readerRefused(await list());await chmod(f.directory,0o700);
+  assert.deepEqual(await readFile(f.file('synthetic-key')),Buffer.alloc(64,0x32));
+});
+
+test('forced reader bounds ignored stdin and refuses a sender that never finishes it',async t=>{
+  const f=await readerFixture(t),command=readerCommand({directory:f.directory,operation:'list'});
+  const accepted=await runReader(f.directory,command,{input:Buffer.alloc(65536,0x78)});assert.equal(accepted.code,0);assert.deepEqual(JSON.parse(accepted.stdout),[f.entry]);
+  readerRefused(await runReader(f.directory,command,{input:Buffer.alloc(65537,0x78)}));
+  readerRefused(await runReader(f.directory,command,{keepInputOpen:true}));
+});
+
+test('forced reader counts foreign entries toward the scan limit and emits no partial list on overflow',async t=>{
+  const f=await fixture(t),directory=path.join(await realpath(f.dir),'encrypted');await mkdir(directory,{mode:0o700});
+  for(let start=0;start<4096;start+=64)await Promise.all(Array.from({length:64},(_,offset)=>writeFile(path.join(directory,`foreign-${start+offset}`),'',{mode:0o600})));
+  const command=readerCommand({directory,operation:'list'}),result=await runReader(directory,command);
+  assert.equal(result.code,0);assert.deepEqual(JSON.parse(result.stdout),[]);assert.equal(result.stderr.length,0);
+  await writeFile(path.join(directory,'one-too-many'),'');readerRefused(await runReader(directory,command));
 });
