@@ -103,8 +103,9 @@ export class AuthService {
       this.#db.exec(`RELEASE SAVEPOINT ${name}`);
       return result;
     } catch (error) {
-      this.#db.exec(`ROLLBACK TO SAVEPOINT ${name}`);
-      this.#db.exec(`RELEASE SAVEPOINT ${name}`);
+      // SQLITE_FULL can roll back the entire transaction, including savepoints.
+      // Preserve that cause instead of replacing it with "no such savepoint".
+      if(this.#db.isTransaction){this.#db.exec(`ROLLBACK TO SAVEPOINT ${name}`);this.#db.exec(`RELEASE SAVEPOINT ${name}`);}
       throw error;
     }
   }

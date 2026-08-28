@@ -123,3 +123,26 @@ main{max-width:1600px;margin:0 auto;padding:36px clamp(22px,4vw,68px) 16px}.intr
 #rules-document,#rules-accept,#rules-cancel{width:100%;min-height:44px}#rules-version{margin-top:12px}#rules-cancel{margin-top:12px}#rules-retry{min-height:44px;margin-top:12px}#account-consent{margin-bottom:20px}#account-consent .consent{margin-bottom:8px}#account-consent>.field-help{margin-bottom:8px}
 
 #rules-consent .field-help{margin-bottom:16px}#rules-consent .consent,#account-consent .consent{min-height:44px;padding-block:8px}
+
+/* Optional presentation extends the existing account sheet and post detail. */
+.presentation-privacy{padding:16px 0;color:var(--ink);font-weight:600;line-height:1.55;border-bottom:1px solid var(--line);margin-bottom:20px}
+.presentation-option{border-top:1px solid var(--line);padding:12px 0;margin:12px 0}
+.presentation-option>summary{font-weight:750;min-height:44px;padding:12px 0;cursor:pointer}
+.presentation-option>summary:focus-visible{outline:3px solid #427d23;outline-offset:4px}
+.presentation-option[open]>summary{margin-bottom:8px}
+.presentation-option .field-label{margin-top:16px}
+.presentation-media{display:grid;gap:14px;min-width:0;margin:12px 0}
+.presentation-media img,.presentation-media video{display:block;width:100%;height:auto;max-height:420px;object-fit:contain;background:var(--ink);border-radius:var(--radius)}
+.presentation-media p{overflow-wrap:anywhere;white-space:pre-wrap}
+.presentation-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:12px 0}
+.presentation-publish{border-top:1px solid var(--line);padding-top:24px;margin-top:24px}
+#presentation-editor .button{width:100%;margin-top:12px;white-space:normal;min-height:48px;padding:12px 16px}
+#presentation-editor .text-button{min-height:44px;text-align:left;white-space:normal}
+#presentation-editor .presentation-actions .button{width:auto;margin:0}
+#presentation-editor input[type=file]{width:100%;min-width:0;font-size:14px;padding:10px 0;background:transparent;border:0}
+#presentation-editor input[type=file]::file-selector-button{font:inherit;font-weight:700;border:1px solid var(--line);border-radius:8px;background:var(--white);color:var(--ink);padding:12px;margin-right:10px;cursor:pointer}
+#presentation-editor input[type=file]::file-selector-button:hover{background:var(--green-soft)}
+#presentation-editor textarea{font-size:16px;resize:vertical}
+#presentation-editor textarea::placeholder{color:var(--muted);opacity:1}
+#presentation-editor [role=status]{margin-top:12px}
+@media(max-width:600px){.presentation-media img,.presentation-media video{max-height:340px}#presentation-editor .presentation-actions{align-items:stretch}#presentation-editor .presentation-actions .button{width:100%}}

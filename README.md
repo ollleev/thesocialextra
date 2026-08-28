@@ -6,7 +6,7 @@ Des annonces locales et des conversations privées pour trouver un renfort ou un
 
 ## Deux serveurs distincts
 
-Node.js 24.12 ou supérieur. Aucune dépendance npm à installer. Les tests vocaux et l’option d’envoi vocal nécessitent FFmpeg et ffprobe avec libopus. Les versions 6.1.1 (Linux) et 9.0.1 (Mac) ont été testées ; le service texte peut fonctionner sans ces binaires. `node:sqlite` est encore expérimental dans la version 24.13 vérifiée.
+Node.js 24.12 ou supérieur. Aucune dépendance npm à installer. Les tests médias et les options vocal/photo/vidéo nécessitent FFmpeg et ffprobe avec les codecs correspondants (notamment libopus et libx264). Les versions 6.1.1 (Linux) et 9.0.1 (Mac) ont été testées ; le service texte peut fonctionner sans ces binaires. `node:sqlite` est encore expérimental dans la version 24.13 vérifiée.
 
 ```sh
 # Démonstration locale, données fictives et volatiles
@@ -36,7 +36,7 @@ Ouvrir ensuite l’adresse locale 4179. HTTP est autorisé uniquement en mode lo
 - Installation web facultative. Hors connexion, une page statique explique l’indisponibilité ; aucune annonce ni conversation n’est mise en cache par le service worker.
 - Aucun paiement ni contrat traité. The Notice est un lien vers un service distinct, sans transfert automatique des comptes.
 
-Les identités, autorisations de travail et compétences ne sont pas vérifiées par ce logiciel. Les vocaux restent désactivés tant qu’un service de conversion isolé n’est pas configuré. Photos et vidéos ne font pas partie de cette version. Le micro est facultatif ; l’enregistrement est réécoutable avant un envoi explicite. Aucun test sur microphone physique ni publication sur téléphone n’est revendiqué ici.
+Les identités, autorisations de travail et compétences ne sont pas vérifiées par ce logiciel. Les vocaux restent désactivés tant qu’un service de conversion isolé n’est pas configuré. La présentation facultative (bio, photo et vidéo de15secondes avec résumé écrit) reste également désactivée sans un worker isolé distinct et PRESENTATION_SOCKET. Choisir un fichier ne l’envoie pas ; un envoi explicite crée un brouillon privé, puis une publication explicite le rend visible depuis les annonces ouvertes. Le micro est facultatif ; l’enregistrement est réécoutable avant un envoi explicite. Aucun test sur microphone physique ni publication sur téléphone n’est revendiqué ici.
 
 ## Exploiter et contribuer
 

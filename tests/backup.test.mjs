@@ -5,7 +5,7 @@ import childProcess,{spawn} from 'node:child_process';
 import {syncBuiltinESMExports} from 'node:module';
 import path from 'node:path';
 import {tmpdir} from 'node:os';
-import {openDatabase} from '../database.mjs';
+import {openDatabase,DATABASE_MAX_BYTES,isDatabaseFull} from '../database.mjs';
 import {createBackup} from '../backup.mjs';
 import {backupKey,encryptBackup,decryptBackup} from '../ops/backup-crypto.mjs';
 import {runBackup,waitForLiveWal} from '../ops/backup-job.mjs';
@@ -13,6 +13,18 @@ import {pullBackup,readPullConfig,createSSHTransport} from '../ops/backup-pull.m
 import {runPullJob,checkPullJob} from '../ops/backup-pull-job.mjs';
 
 async function fixture(t){const dir=await mkdtemp(path.join(tmpdir(),'thesocialextra-backup-'));t.after(()=>rm(dir,{recursive:true,force:true}));return {dir,file:name=>path.join(dir,name)};}
+test('SQLite page capacity bounds full backups, survives reopening and never deletes existing rows on overflow',async t=>{
+ const f=await fixture(t),filename=f.file('bounded.sqlite');let db=openDatabase(filename,{maxBytes:32*1024});
+ try {
+  db.exec('CREATE TABLE synthetic(bytes BLOB) STRICT');db.prepare('INSERT INTO synthetic VALUES(?)').run(Buffer.alloc(8*1024,7));
+  db.exec('BEGIN');assert.throws(()=>db.prepare('INSERT INTO synthetic VALUES(?)').run(Buffer.alloc(64*1024)),isDatabaseFull);
+  assert.equal(db.isTransaction,false);assert.equal(db.prepare('SELECT COUNT(*) n FROM synthetic').get().n,1);
+  await createBackup(filename,f.file('snapshot.sqlite'));assert.ok((await stat(f.file('snapshot.sqlite'))).size<=32*1024);
+ }finally{db.close();}
+ db=openDatabase(filename,{maxBytes:32*1024});try{assert.throws(()=>db.prepare('INSERT INTO synthetic VALUES(?)').run(Buffer.alloc(64*1024)),isDatabaseFull);assert.equal(db.prepare('PRAGMA integrity_check').get().integrity_check,'ok');}finally{db.close();}
+ db=openDatabase(filename);try{const pages=db.prepare('PRAGMA max_page_count').get().max_page_count,size=db.prepare('PRAGMA page_size').get().page_size;assert.ok(pages*size<=DATABASE_MAX_BYTES);assert.ok(8*(pages*size+36)<4*1024**3);}finally{db.close();}
+ assert.throws(()=>openDatabase(filename,{maxBytes:8192}),/database_exceeds_configured_capacity/);
+});
 test('online SQLite backup encrypts and restores to an authenticated, intact separate database',async t=>{
   const f=await fixture(t),db=openDatabase(f.file('source.sqlite'));t.after(()=>db.close());
   db.exec('CREATE TABLE synthetic(id INTEGER PRIMARY KEY,value TEXT) STRICT');db.prepare('INSERT INTO synthetic(value) VALUES(?)').run('synthetic backup evidence');

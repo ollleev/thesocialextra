@@ -8,10 +8,13 @@ import { ApiError, ZONES, ROLE_GROUPS, fields, validateIdempotencyKey } from './
 import { searchLocations, nearestLocation, getLocation, LocationError } from './locations.mjs';
 import { AuthService } from './auth.mjs';
 import { ProductionStore } from './production-store.mjs';
-import { openDatabase } from './database.mjs';
+import { openDatabase, isDatabaseFull } from './database.mjs';
 import { readVoiceBody, sendVoice } from './voice-http.mjs';
 import { normalizeViaWorker } from './voice-worker.mjs';
-import { RULES, rulesDocument } from './rules.mjs';
+import { RULE_DOCUMENTS, rulesDocument } from './rules.mjs';
+import { PresentationStore } from './presentation-store.mjs';
+import { readPresentationBody, sendPresentation } from './presentation-http.mjs';
+import { presentationViaWorker } from './presentation-worker.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MUTATING = new Set(['POST', 'PATCH', 'DELETE', 'PUT']);
@@ -87,22 +90,28 @@ function scopeFrom(params) {
 /** HTTPS terminates at the configured reverse proxy; never expose this listener directly. */
 export function createProductionServer({ db, publicOrigin, publicDir=path.join(HERE,'public'), clock=Date.now,
   authOptions={}, moderators=[], allowLocalHttp=false, trustedProxyAddresses=[], voiceSocketPath=null, testVoiceProcessor,
+  presentationSocketPath=null,testPresentationProcessor,
   rateLimit=240, mutationRateLimit=60, accountRateLimit=120, authRateLimit=15, authAccountRateLimit=10,
   rateWindowMs=60_000, authWindowMs=15*60_000, rateMaxEntries=10000,
   maxBlocksPerUser=500, maxTotalBlocks=100000,
   maxStreams=256, maxStreamsPerIp=8, sweepIntervalMs=1000, heartbeatIntervalMs=15_000 }={}) {
   const {url:origin,secure}=configuredOrigin(publicOrigin,allowLocalHttp);
   if(authOptions.testRules!==undefined)throw new TypeError('The HTTP server always uses the verified rules document');
-  const verifiedRulesBytes=rulesDocument();
+  const verifiedRulesDocuments=new Map(RULE_DOCUMENTS.map(rule=>[rule.url,rulesDocument(rule.version)]));
   if(voiceSocketPath!==null && (typeof voiceSocketPath!=='string'||!path.isAbsolute(voiceSocketPath)||voiceSocketPath.length>100||/[\0\r\n]/.test(voiceSocketPath))) throw new TypeError('A trusted absolute voice socket is required');
   if(testVoiceProcessor!==undefined && (!process.env.NODE_TEST_CONTEXT || typeof testVoiceProcessor!=='function')) throw new TypeError('Voice injection is for the native test runner only');
   const processVoice=testVoiceProcessor??((bytes,options)=>normalizeViaWorker(bytes,{...options,socketPath:voiceSocketPath}));
+  if(presentationSocketPath!==null&&(typeof presentationSocketPath!=='string'||!path.isAbsolute(presentationSocketPath)||presentationSocketPath.length>100||/[\0\r\n]/.test(presentationSocketPath)))throw new TypeError('A trusted absolute presentation socket is required');
+  if(testPresentationProcessor!==undefined&&(!process.env.NODE_TEST_CONTEXT||typeof testPresentationProcessor!=='function'))throw new TypeError('Presentation injection is for the native test runner only');
+  const processPresentation=testPresentationProcessor??((bytes,options)=>presentationViaWorker(bytes,{...options,socketPath:presentationSocketPath}));
+  let presentationAdmitted=false,presentationDownloads=0;
   let voiceAdmitted=false;
   for(const value of [rateLimit,mutationRateLimit,accountRateLimit,authRateLimit,authAccountRateLimit,rateWindowMs,authWindowMs,rateMaxEntries,maxStreams,maxStreamsPerIp,sweepIntervalMs,heartbeatIntervalMs])
     if(!Number.isSafeInteger(value)||value<1) throw new TypeError('Limits and intervals must be positive integers');
   const trusted=new Set(trustedProxyAddresses.map(normalizeIp));
   if([...trusted].some(ip=>!isIP(ip))) throw new TypeError('Trusted proxies must be exact IP addresses');
   const auth=new AuthService({...authOptions,db,clock}), store=new ProductionStore({db,clock,moderators,maxBlocksPerUser,maxTotalBlocks,hasAcceptedRules:userId=>auth.hasAcceptedRules(userId)});
+  const presentations=presentationSocketPath?new PresentationStore({db,store,clock}):null;
   const moderatorIds=new Set(moderators), cookieName=secure?'__Host-extra_session':'extra_session';
   const staticRoot=path.resolve(publicDir), rates=new Map(), streams=new Set();
   let disposed=false, scheduled=false, broadcasting=false, privateScheduled=false;
@@ -133,6 +142,13 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     const key=req.headers['idempotency-key'];
     if(typeof key!=='string'||key.length<16||key.length>128||/[^a-zA-Z0-9_-]/.test(key)) fail(400,'invalid_idempotency_key');
     validateIdempotencyKey(key);return key;
+  }
+  function deliverPresentation(req,res,read) {
+    if(presentationDownloads>=4)fail(429,'presentation_download_busy');
+    presentationDownloads++;let done=false;
+    const release=()=>{if(!done){done=true;presentationDownloads--;}};
+    res.once('finish',release);res.once('close',release);
+    try{return sendPresentation(req,res,read());}catch(error){release();throw error;}
   }
   function validStream(stream) {
     if(stream.res.destroyed||stream.res.writableEnded) { streams.delete(stream);return false; }
@@ -194,7 +210,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
   const server=http.createServer(async(req,res)=>{
     securityHeaders(res,secure,Boolean(voiceSocketPath));
     try {
-      const singletonHeaders=new Set(['host','origin','cookie','idempotency-key','content-type','content-length','content-encoding','transfer-encoding']),seenHeaders=new Set();
+      const singletonHeaders=new Set(['host','origin','cookie','idempotency-key','content-type','content-length','content-encoding','transfer-encoding','x-presentation-revision','range','if-range']),seenHeaders=new Set();
       for(let i=0;i<req.rawHeaders.length;i+=2){const name=req.rawHeaders[i].toLowerCase();if(singletonHeaders.has(name)&&seenHeaders.has(name))fail(400,'duplicate_header');seenHeaders.add(name);}
       if(req.headers.host!==origin.host) fail(403,'invalid_host');
       if(!req.url?.startsWith('/')||req.url.startsWith('//')||req.url.length>4096) fail(400,'invalid_path');
@@ -211,7 +227,54 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       // while a slow request was uploading. Never authorize writes from stale user data.
       const currentUserId=()=>requireUser(auth.session(token));
       if(user&&pathname.startsWith('/api/')) rate(`account:${user.id}`,accountRateLimit);
-      if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id)),rules:auth.rulesStatus(user?.id),...(voiceSocketPath?{features:{voice:true}}:{})});
+      if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id)),rules:auth.rulesStatus(user?.id),...((voiceSocketPath||presentations)?{features:{...(voiceSocketPath?{voice:true}:{}),...(presentations?{presentation:true}:{})}}:{})});
+      if(presentations) {
+        const ownRoute=pathname.match(/^\/api\/presentation(?:\/(publish|unpublish|photo|video))?$/);
+        if(ownRoute) {
+          const actor=requireUser(user),operation=ownRoute[1];
+          const file=operation==='photo'||operation==='video';
+          if(file&&['GET','HEAD'].includes(req.method)) {
+            const revision=searchParams.get('revision');
+            if([...searchParams.keys()].some(name=>name!=='revision')||searchParams.getAll('revision').length!==1||!/^\d+$/.test(revision??'')||!Number.isSafeInteger(Number(revision)))fail(400,'invalid_presentation_revision');
+            return deliverPresentation(req,res,()=>presentations.ownAsset(actor,operation,{revision:Number(revision)}));
+          }
+          if(searchParams.size)fail(400,'invalid_scope');
+          if(req.method==='GET'&&!operation)return json(res,200,presentations.own(actor));
+          if(file&&req.method==='PUT') {
+            store.ugcWriter(actor);const key=intentKey(req),raw=req.headers['x-presentation-revision'];
+            if(typeof raw!=='string'||!/^\d+$/.test(raw)||!Number.isSafeInteger(Number(raw)))fail(400,'invalid_presentation_revision');
+            if(presentationAdmitted)fail(429,'presentation_busy');presentationAdmitted=true;
+            try {
+              const source=await readPresentationBody(req,operation),metadata={expectedRevision:Number(raw),sourceHash:hash(source.bytes)};
+              const replay=presentations.prepareAsset(currentUserId(),operation,metadata,key);if(replay)return json(res,201,replay);
+              const normalized=await processPresentation(source.bytes,{kind:operation,contentType:source.contentType});
+              if(req.aborted||res.destroyed)return;
+              return json(res,201,presentations.addAsset(currentUserId(),operation,{...metadata,...normalized},key));
+            } finally {presentationAdmitted=false;}
+          }
+          if((req.method==='PATCH'&&!operation)||(req.method==='POST'&&['publish','unpublish'].includes(operation))||req.method==='DELETE') {
+            const input=await body(req),id=currentUserId();
+            if(req.method==='PATCH')return json(res,200,presentations.saveText(id,input));
+            if(req.method==='POST')return json(res,200,presentations[operation](id,input));
+            if(file)return json(res,200,presentations.removeDraftAsset(id,operation,input));
+            if(!operation)return json(res,200,presentations.erase(id,input));
+          }
+          fail(405,'method_not_allowed');
+        }
+        const publicPresentation=pathname.match(/^\/api\/posts\/([a-zA-Z0-9-]{1,80})\/presentation(?:\/(photo|video))?$/);
+        if(publicPresentation&&['GET','HEAD'].includes(req.method)) {
+          const [,id,kind]=publicPresentation;
+          if(!kind){if(searchParams.size)fail(400,'invalid_scope');if(req.method!=='GET')fail(405,'method_not_allowed');return json(res,200,presentations.forPost(id,user?.id));}
+          const version=searchParams.get('v');
+          if([...searchParams.keys()].some(name=>name!=='v')||searchParams.getAll('v').length!==1||!/^[a-zA-Z0-9-]{1,80}$/.test(version??''))fail(400,'invalid_presentation_revision');
+          return deliverPresentation(req,res,()=>presentations.assetForPost(id,kind,user?.id,version));
+        }
+        const reportPresentation=pathname.match(/^\/api\/moderation\/reports\/([a-zA-Z0-9-]{1,80})\/presentation\/(photo|video)$/);
+        if(reportPresentation&&['GET','HEAD'].includes(req.method)) {
+          const actor=requireUser(user);if(searchParams.size)fail(400,'invalid_scope');
+          return deliverPresentation(req,res,()=>presentations.reportAsset(actor,reportPresentation[1],reportPresentation[2]));
+        }
+      }
       if(req.method==='POST'&&pathname==='/api/account/rules-acceptance') {
         requireUser(user);const input=await body(req);
         return json(res,200,auth.acceptRules(currentUserId(),input));
@@ -318,7 +381,8 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       if(!['GET','HEAD'].includes(req.method))fail(405,'method_not_allowed');
       let decoded;try{decoded=decodeURIComponent(pathname);}catch{fail(400,'invalid_path');}
       if(decoded.includes('\0')||decoded.includes('\\')||decoded.split('/').some(part=>part.startsWith('.')))fail(404,'not_found');
-      if(path.posix.normalize(decoded)===RULES.url) {
+      const verifiedRulesBytes=verifiedRulesDocuments.get(path.posix.normalize(decoded));
+      if(verifiedRulesBytes) {
         res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Content-Length':verifiedRulesBytes.length});
         return res.end(req.method==='HEAD'?undefined:verifiedRulesBytes);
       }
@@ -329,6 +393,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     } catch(error) {
       if(res.destroyed||res.writableEnded)return;
       if(res.headersSent){res.destroy();return;}
+      if(isDatabaseFull(error))error=new ApiError(503,'storage_capacity_reached');
       const expected=error instanceof ApiError||error instanceof LocationError,status=expected?error.status:500;
       if(status===429)res.setHeader('Retry-After',String(error.retryAfter??(error.code==='auth_busy'?1:Math.ceil(rateWindowMs/1000))));
       if(!req.complete){res.setHeader('Connection','close');req.resume();}
@@ -341,7 +406,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
   const heartbeat=setInterval(()=>{for(const stream of streams)if(validStream(stream))stream.res.write(': heartbeat\n\n');},heartbeatIntervalMs);heartbeat.unref();
   function dispose(){disposed=true;clearInterval(sweepTimer);clearInterval(heartbeat);unsubscribe();unsubscribePrivate();privateReaders.clear();for(const stream of streams)stream.res.end();streams.clear();}
   server.once('close',dispose);
-  return {server,store,auth,async close(){dispose();if(!server.listening)return;await new Promise((resolve,reject)=>{server.close(error=>error?reject(error):resolve());server.closeAllConnections();});}};
+  return {server,store,auth,presentations,async close(){dispose();if(!server.listening)return;await new Promise((resolve,reject)=>{server.close(error=>error?reject(error):resolve());server.closeAllConnections();});}};
 }
 
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
@@ -352,7 +417,7 @@ if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.ur
   if(allowLocalHttp&&!['127.0.0.1','localhost','::1'].includes(host))throw new Error('Local HTTP must bind loopback');
   if(!process.env.DATABASE_PATH||!path.isAbsolute(process.env.DATABASE_PATH))throw new Error('An absolute DATABASE_PATH is required');
   const db=openDatabase(process.env.DATABASE_PATH);
-  let app;try{app=createProductionServer({db,publicOrigin,allowLocalHttp,voiceSocketPath:process.env.VOICE_SOCKET||null,moderators:(process.env.MODERATOR_IDS||'').split(',').filter(Boolean),trustedProxyAddresses:(process.env.TRUSTED_PROXY_IPS||'').split(',').filter(Boolean)});}catch(error){db.close();throw error;}
+  let app;try{app=createProductionServer({db,publicOrigin,allowLocalHttp,voiceSocketPath:process.env.VOICE_SOCKET||null,presentationSocketPath:process.env.PRESENTATION_SOCKET||null,moderators:(process.env.MODERATOR_IDS||'').split(',').filter(Boolean),trustedProxyAddresses:(process.env.TRUSTED_PROXY_IPS||'').split(',').filter(Boolean)});}catch(error){db.close();throw error;}
   app.server.on('error',error=>{console.error(`Production server startup failed: ${error.code||'unknown_error'}`);app.close().finally(()=>db.close());process.exitCode=1;});
   app.server.listen(port,host,()=>console.log('Production listener ready; use the configured public origin.'));
   for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>{app.close().then(()=>db.close()).catch(()=>{process.exitCode=1;});});

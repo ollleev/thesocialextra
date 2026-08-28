@@ -8,6 +8,7 @@ import { makeFeedShare, parseFeedLink } from './sharing.js';
 import { VoiceComposer, uploadVoice } from './voice.js';
 import { createBlockUI } from './blocks.js';
 import { createRulesUI } from './rule-consent.js';
+import { createPresentationUI, presentationError } from './presentation.js';
 
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -50,7 +51,7 @@ const accounts = createAccountUI({openDialog,onError:errorText,onChange:async se
   $('#moderation-button').hidden=!session.moderator;
   if(state.production) {
     if(changed) {
-      accountGeneration++;state.feedRevision=0;blockUI.reset();rulesUI.reset();$('#blocks').close();$('#block-author').close(); for(const id of Object.keys(threads)) delete threads[id];
+      accountGeneration++;state.feedRevision=0;blockUI.reset();rulesUI.reset();presentationUI.reset();$('#blocks').close();$('#block-author').close(); for(const id of Object.keys(threads)) delete threads[id];
       voice.discard();stopAudio($('#chat'),true);stopAudio($('#moderation'),true);
       outbox.retain(new Set());writeIntents.clear();mutationKeys.clear();state.chat=null;state.chatPrivacyPending=false;
       state.mine=false;state.posts=[];state.readMarkers=state.user?readSession(`thesocialextra-read:${state.user.id}`):{};
@@ -68,12 +69,14 @@ const accounts = createAccountUI({openDialog,onError:errorText,onChange:async se
     $('#help .help-copy').innerHTML='<p><strong>Vous êtes dispo ?</strong><br>Choisissez votre métier, une ville et une durée. Votre point apparaît en vert.</p><p><strong>Il manque quelqu’un ?</strong><br>Publiez votre besoin. Parlez-vous, puis confirmez chaque place vous-même. Un message ne réserve rien.</p><p><strong>Le fil reste frais.</strong><br>Les annonces pourvues quittent le fil public. Vous pouvez rouvrir une place jusqu’à l’expiration initiale. Les conversations privées restent disponibles sept jours après cette expiration, sauf suppression ou modération.</p><p><strong>Vous gardez la main.</strong><br>La localisation est approximative, à votre demande. Signalez un contenu ou bloquez un compte depuis une annonce ou un échange. Gérez vos blocages dans Mon compte. Les réponses sont actualisées quand l’application est visible ; pas de notification quand elle est fermée.</p><p><strong>Gratuit des deux côtés.</strong><br>Ni paiement ni contrat ne sont gérés ici. Les identités, compétences et autorisations de travail ne sont pas vérifiées. Convenez des conditions et effectuez les vérifications nécessaires avant toute mission.</p><p><a href="/privacy.html">Confidentialité et règles d’utilisation</a></p>';
   }
   renderVoice();
+  presentationUI.changed();
   rulesUI.changed();
   if(liveReady) { void changeFeed();void pollUpdates(); }
 }});
 $('#account-button').addEventListener('click',()=>accounts.show());
 const blockUI=createBlockUI({$,api,requireAccount:next=>accounts.require(next),getGeneration:()=>accountGeneration,openDialog,errorText,toast,onRevision:applyFeedRevision,refreshFeed:async()=>{await changeFeed();void pollUpdates();void refreshChat();}});
 const rulesUI=createRulesUI({$,api,getSession:()=>accounts.session,getGeneration:()=>accountGeneration,refreshSession:()=>accounts.refresh(),applyRules:rules=>accounts.updateRules(rules),errorText,beforeOpen:()=>{if(voice.phase==='requesting')voice.discard();else if(voice.phase==='recording')voice.stop();}});
+const presentationUI=createPresentationUI({$,api,openDialog,errorText,getGeneration:()=>accountGeneration,getSession:()=>accounts.session,requireUGC:next=>requireUGC(next),onRulesError:(error,next,account)=>rulesError(error,next,account),onPublicChange:()=>refreshPublicState(),onReport:(id,version)=>openReport('post',id,version),now:()=>now()});
 function requireUGC(next) {if(!accounts.require(()=>{if(rulesUI.require(next))next?.();}))return false;return rulesUI.require(next);}
 function rulesError(error,next,account=accountGeneration) {if(account!==accountGeneration||!['rules_acceptance_required','rules_version_changed'].includes(error.code))return false;void rulesUI.renew(next);return true;}
 let composerGeneration = 0, publishing = false;
@@ -82,6 +85,8 @@ let toastTimer, chatTimer;
 let updatesRequest, updatesCursor = 0, updatesError = false, updatesCheckedAt = 0;
 function toast(message) { clearTimeout(toastTimer); $('#toast').textContent = message; $('#toast').hidden = false; toastTimer = setTimeout(() => $('#toast').hidden = true, 4500); }
 function errorText(error) {
+  if(error.code==='storage_capacity_reached')return 'Le stockage du service est plein. Cette opération n’a pas été enregistrée. Réessayez plus tard ; vos contenus existants ne sont pas effacés pour faire de la place.';
+  const presentationMessage=presentationError(error,()=>null);if(presentationMessage)return presentationMessage;
   if(error.code==='rules_acceptance_required')return 'Acceptez les règles de publication pour publier ou envoyer un message. Votre brouillon est conservé.';
   if(error.code==='rules_version_changed')return 'Les règles ont changé. Lisez la nouvelle version puis cochez à nouveau la case.';
   if(error.code==='block_capacity_reached')return 'Votre liste de comptes bloqués a atteint sa capacité. Vos blocages existants restent actifs.';
@@ -191,7 +196,7 @@ function openDialog(dialog) { $$('dialog[open]').forEach(d => d.close()); dialog
 $$('.close-dialog').forEach(button => button.addEventListener('click', () => button.closest('dialog').close()));
 $$('dialog').forEach(dialog => {
   dialog.addEventListener('click', e => { if (e.target === dialog) { const r = dialog.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right) dialog.close(); } });
-  dialog.addEventListener('close', () => { if(dialog.id==='detail'&&!dialog.open) restoreLiveOpener(detailOpener,detailOpener?.container===$('#post-list')?[$('#feed-title'),$('#map')]:[$('#map'),$('#feed-title')]); if (dialog.id === 'chat' && !dialog.open) { clearInterval(chatTimer); state.chat = null; voice.discard();stopAudio(dialog); } if(dialog.id==='moderation')stopAudio(dialog); });
+  dialog.addEventListener('close', () => { if(dialog.id==='detail'&&!dialog.open) {presentationUI.stopView();restoreLiveOpener(detailOpener,detailOpener?.container===$('#post-list')?[$('#feed-title'),$('#map')]:[$('#map'),$('#feed-title')]);} if (dialog.id === 'chat' && !dialog.open) { clearInterval(chatTimer); state.chat = null; voice.discard();stopAudio(dialog); } if(dialog.id==='moderation')stopAudio(dialog); });
 });
 function openComposer(kind) {
   if(!requireUGC(()=>openComposer(kind))) return;
@@ -281,6 +286,7 @@ $('#share-feed').addEventListener('click', async () => {
 // Update live fields in place: an SSE event must never replace a visitor's draft.
 function updateDetail(post) {
   const closed = post.status !== 'open'||post.expiresAt<=now()||state.detailUnavailable;
+  presentationUI.updatePost(closed?{...post,presentationId:null}:post);
   $('#detail-title').textContent = closed && post.kind === 'need' ? `${post.role} · mission pourvue.` : `${title(post)}.`;
   $('#detail-status').className = `state-label ${closed ? 'full' : post.kind === 'need' ? 'need' : ''}`;
   $('#detail-status-text').textContent = statusLabel(post);
@@ -336,7 +342,7 @@ function openDetail(id) {
   const post = state.posts.find(p => p.id === id && p.expiresAt > now()); if (!post) { toast('Cette annonce a expiré.'); return; }
   detailOpener = captureLiveOpener([$('#post-list'),$('#map-pins'),$('#map-selection')]) || (state.detailId===id ? detailOpener : null);
   state.detailId = id;state.detailPost=post;state.detailUnavailable=false; const own = Boolean(owners[id]);
-  $('#detail-content').innerHTML = `<div class="detail-role">${icon(roleIcon(post.role))}</div><div class="detail-state" aria-live="polite"><span id="detail-status" class="state-label"><span class="status-dot"></span><span id="detail-status-text"></span></span></div><h2 id="detail-title">${esc(title(post))}.</h2><p class="sheet-subtitle">${esc(post.zoneLabel)} · ${post.demo ? 'Exemple fictif' : own ? 'Votre annonce' : state.production ? 'Annonce locale' : 'Essai local'}</p><div class="detail-facts"><div>${icon('clock')}<span id="detail-expiration"></span></div>${post.english ? `<div>${icon('languages')}${post.kind === 'need' ? 'Anglais demandé' : 'Parle anglais'}</div>` : ''}${post.vehicle ? `<div>${icon('car')}${post.kind === 'need' ? 'Véhicule demandé' : 'Véhiculé'}</div>` : ''}${post.kind === 'need' ? `<div>${icon('briefcase-business')}<strong id="detail-places" aria-live="polite"></strong></div>` : ''}${post.pay ? `<div>${icon('check')}${esc(post.pay)} €/h annoncé · à confirmer ensemble</div>` : ''}</div>${post.note ? `<p class="detail-note">${esc(post.note)}</p>` : ''}<p id="detail-closed" class="detail-disclaimer" role="status" hidden></p>
+  $('#detail-content').innerHTML = `<div class="detail-role">${icon(roleIcon(post.role))}</div><div class="detail-state" aria-live="polite"><span id="detail-status" class="state-label"><span class="status-dot"></span><span id="detail-status-text"></span></span></div><h2 id="detail-title">${esc(title(post))}.</h2><p class="sheet-subtitle">${esc(post.zoneLabel)} · ${post.demo ? 'Exemple fictif' : own ? 'Votre annonce' : state.production ? 'Annonce locale' : 'Essai local'}</p><div class="detail-facts"><div>${icon('clock')}<span id="detail-expiration"></span></div>${post.english ? `<div>${icon('languages')}${post.kind === 'need' ? 'Anglais demandé' : 'Parle anglais'}</div>` : ''}${post.vehicle ? `<div>${icon('car')}${post.kind === 'need' ? 'Véhicule demandé' : 'Véhiculé'}</div>` : ''}${post.kind === 'need' ? `<div>${icon('briefcase-business')}<strong id="detail-places" aria-live="polite"></strong></div>` : ''}${post.pay ? `<div>${icon('check')}${esc(post.pay)} €/h annoncé · à confirmer ensemble</div>` : ''}</div>${post.note ? `<p class="detail-note">${esc(post.note)}</p>` : ''}<details id="detail-presentation" class="presentation-option" hidden><summary>Voir la présentation</summary><div data-presentation-content class="presentation-media"></div></details><p id="detail-closed" class="detail-disclaimer" role="status" hidden></p>
   ${post.demo ? `<p class="detail-disclaimer">Cette annonce illustre le service. Aucune personne réelle n’est derrière cet exemple. Publiez un essai et ouvrez-le dans une autre fenêtre pour tester le contact.</p><button class="button lime" data-try>Créer mon essai${icon('plus')}</button>` : own ? `<div class="detail-actions">${post.kind === 'need' ? `<button class="button lime" data-mutate="fill">Une place confirmée${icon('check')}</button>` : ''}<button class="button outline" data-mutate="close">${post.kind === 'need' ? 'Tout est pourvu' : 'Je ne suis plus dispo'}</button><button class="button lime" data-mutate="reopen">${post.kind === 'need' ? 'Rouvrir une place' : 'Je suis de nouveau dispo'}${icon('plus')}</button><button class="button outline" data-owner-inbox>Voir les réponses${icon('message-circle')}</button></div><p class="detail-disclaimer">${post.kind === 'need' ? 'Confirmez une place seulement après accord avec la personne. Un message ne réserve rien.' : 'Votre disponibilité expire automatiquement.'}</p>` : `<form id="contact-form" class="contact-form"><label class="field-label" for="contact-message">Votre premier message</label><p class="quick-reply-help">Un clic préremplit le message. À vous de l’envoyer.</p><div class="quick-replies" role="group" aria-label="Suggestions de premier message">${(post.kind === 'need' ? ['Bonjour, votre besoin est-il toujours d’actualité ?', 'Bonjour, quels sont les horaires ?'] : ['Bonjour, êtes-vous toujours disponible ?', 'Bonjour, pour quels horaires êtes-vous disponible ?']).map(text => `<button type="button" data-suggestion="${esc(text)}">${esc(text)}</button>`).join('')}</div><textarea id="contact-message" maxlength="500" required placeholder="Bonjour, toujours disponible ?"></textarea><button class="button lime" type="submit">Contacter directement${icon('send')}</button><p class="detail-disclaimer">${state.production?'Échange privé. Convenez des horaires et conditions ensemble.':'Échange dans ce prototype, sans coordonnées personnelles.'} Une réponse ne réserve aucune place.</p></form>`}${state.production?`<div class="safety-actions">${own?'<button class="text-button" data-delete-post>Supprimer l’annonce</button>':'<button class="text-button" data-report-post>Signaler cette annonce</button><button class="text-button" data-block-author>Bloquer ce compte</button>'}</div>`:''}<p id="detail-error" class="form-error" role="alert" hidden></p><button class="text-button" data-share>${icon('share-2')}Copier le lien de cette annonce</button><p class="fine-print">${state.production?'Lien partageable · L’annonce disparaît à expiration.':'Lien de test local · Ne fonctionne pas sur un autre appareil.'}</p>`;
   updateDetail(post); openDialog($('#detail'));
   const form = $('#contact-form'); if (form) form.addEventListener('submit', async e => {
@@ -407,9 +413,9 @@ $('#detail-content').addEventListener('click', async e => {
 });
 
 let reportTarget=null,deletePostId=null;
-function openReport(targetType,targetId) {
-  if(!accounts.require(()=>openReport(targetType,targetId)))return;
-  reportTarget={targetType,targetId};$('#report-form').reset();$('#report-error').hidden=true;openDialog($('#report'));
+function openReport(targetType,targetId,presentationId) {
+  if(!accounts.require(()=>openReport(targetType,targetId,presentationId)))return;
+  reportTarget={targetType,targetId,...(presentationId?{presentationId}:{})};$('#report-title').textContent=presentationId?'Signaler cette présentation.':'Signaler un contenu.';$('#report-form').reset();$('#report-error').hidden=true;openDialog($('#report'));
 }
 $('#chat-report').addEventListener('click',()=>openReport('thread',state.chat));
 $('#report-form').addEventListener('submit',async event=>{
@@ -439,7 +445,7 @@ async function refreshModeration() {
     const data=await api('/api/moderation/reports'),reports=Array.isArray(data)?data:data.reports;
     if(generation!==accountGeneration||!state.moderator||!$('#moderation').open)return;
     stopAudio($('#moderation'),true);
-    $('#moderation-list').innerHTML=reports.length?reports.map(report=>`<article class="moderation-report"><h3>${esc(report.reason)}</h3><p>${esc(report.details)}</p><details><summary>Voir le contenu signalé</summary><pre>${esc(report.evidence)}</pre>${reportVoiceMarkup(report)}</details><div class="safety-actions"><button class="button danger" data-resolve-report="${esc(report.id)}" data-action="remove">Retirer le contenu</button><button class="button outline" data-resolve-report="${esc(report.id)}" data-action="dismiss">Classer sans suite</button></div></article>`).join(''):'<p>Aucun signalement en attente.</p>';
+    $('#moderation-list').innerHTML=reports.length?reports.map(report=>`<article class="moderation-report"><h3>${esc(report.reason)}</h3><p>${esc(report.details)}</p><details><summary>Voir le contenu signalé</summary><pre>${esc(report.evidence)}</pre>${reportVoiceMarkup(report)}${reportPresentationMarkup(report)}</details><div class="safety-actions"><button class="button danger" data-resolve-report="${esc(report.id)}" data-action="remove">Retirer le contenu</button><button class="button outline" data-resolve-report="${esc(report.id)}" data-action="dismiss">Classer sans suite</button></div></article>`).join(''):'<p>Aucun signalement en attente.</p>';
   }catch(error){if(generation===accountGeneration&&state.moderator){$('#moderation-error').textContent=errorText(error);$('#moderation-error').hidden=false;}}
 }
 $('#moderation-button').addEventListener('click',()=>{openDialog($('#moderation'));void refreshModeration();});
@@ -532,7 +538,7 @@ $('#inbox-list').addEventListener('click', e => { const button = e.target.closes
 let chatRequest = 0;
 const chatReads = new Map();
 function stopAudio(root,forget=false) {
-  root.querySelectorAll('audio').forEach(audio=>{audio.pause?.();if(forget){audio.removeAttribute('src');audio.load?.();}});
+  root.querySelectorAll('audio,video').forEach(audio=>{audio.pause?.();if(forget){audio.removeAttribute('src');audio.load?.();}});
 }
 function invalidateUnavailableChat() {
   if(!state.chat||threads[state.chat])return;
@@ -546,6 +552,13 @@ function reportVoiceMarkup(report) {
   try {
     const messages=JSON.parse(report.evidence).thread?.messages||[];
     return messages.filter(message=>message.voice&&/^[a-zA-Z0-9-]{1,80}$/.test(message.id)).map(message=>`<p class="voice-message-label">Vocal signalé · ${Math.ceil(message.voice.durationMs/1000)} s</p><audio controls preload="none" aria-label="Écouter le vocal signalé" src="/api/moderation/reports/${encodeURIComponent(report.id)}/voice/${encodeURIComponent(message.id)}"></audio>`).join('');
+  }catch{return '';}
+}
+function reportPresentationMarkup(report) {
+  try {
+    const presentation=JSON.parse(report.evidence).presentation;if(!presentation)return '';
+    const base=`/api/moderation/reports/${encodeURIComponent(report.id)}/presentation`;
+    return `<div class="presentation-media">${presentation.photo?`<a class="button outline" href="${base}/photo" target="_blank" rel="noopener">Voir la photo signalée</a>`:''}${presentation.video?`<video controls playsinline preload="none" aria-label="Vidéo signalée" src="${base}/video"></video><p>${esc(presentation.videoText)}</p>`:''}<button class="button danger" data-resolve-report="${esc(report.id)}" data-action="remove-presentation">Retirer la présentation de toutes les annonces</button></div>`;
   }catch{return '';}
 }
 function renderVoice() {

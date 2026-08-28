@@ -2,12 +2,22 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import {createHash,randomUUID} from 'node:crypto';
-import {mkdtemp,writeFile,symlink,rm,mkdir} from 'node:fs/promises';
+import {mkdtemp,writeFile,readFile,symlink,rm,mkdir} from 'node:fs/promises';
+import {spawnSync,execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {openDatabase} from '../database.mjs';
 import {createProductionServer} from '../production-server.mjs';
-import {RULES} from '../rules.mjs';
+import {RULES,RULE_DOCUMENTS} from '../rules.mjs';
+import {createPresentationWorker} from '../presentation-worker.mjs';
+import {createImageNormalizer} from '../image-processing.mjs';
+import {createVideoNormalizer} from '../video-processing.mjs';
+import {createBackup} from '../backup.mjs';
+import {backupKey,encryptBackup,decryptBackup} from '../ops/backup-crypto.mjs';
+import {AuthService} from '../auth.mjs';
+import {ProductionStore} from '../production-store.mjs';
+import {PresentationStore} from '../presentation-store.mjs';
 
 const AGREEMENT={acceptedRules:true,rulesVersion:RULES.version};
 
@@ -15,12 +25,15 @@ const PASSWORD='synthetic password sufficiently long';
 const testKdf=async(password,salt)=>createHash('sha512').update(password).update(salt).digest();
 const input=(extra={})=>({kind:'need',role:'Barman',cityId:'2988507',english:false,vehicle:false,durationMinutes:30,places:2,note:'Synthétique.',...extra});
 const key=()=>randomUUID();
+// Processor boundary stub, never claimed as decodable media. Real decoder
+// fixtures are covered separately in image/video-processing tests.
+const presentationPhoto=()=>({bytes:Buffer.from([255,216,1,2,3,4,255,217]),contentType:'image/jpeg',width:20,height:10});
 async function fixture(t,options={}) {
-  const db=openDatabase(':memory:');let now=1_800_000_000_000;
+  const db=openDatabase(options.databasePath??':memory:');let now=1_800_000_000_000;
   const publicOrigin=options.publicOrigin??'https://extras.test';
   const app=createProductionServer({db,publicOrigin,clock:()=>now,authOptions:{testKdf},sweepIntervalMs:20,heartbeatIntervalMs:20,...options});
   await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
-  t.after(async()=>{await app.close();db.close();});
+  t.after(async()=>{await app.close();if(db.isOpen)db.close();});
   const port=app.server.address().port;
   function request(url, {method='GET',body,cookie,headers={},rawBody,origin=true}={}) {
     const payload=rawBody??(body===undefined?undefined:JSON.stringify(body));
@@ -496,7 +509,7 @@ test('rules HTTP metadata identifies the exact served document and registration 
   assert.deepEqual((await f.request('/api/session')).data.rules,{...RULES,accepted:false});
   const document=await f.request(RULES.url);assert.equal(document.status,200);
   assert.equal(createHash('sha256').update(document.bytes).digest('hex'),RULES.sha256);
-  assert.match(document.text,/Version 2026-08-28.1/);assert.match(document.text,/mentions de l’opérateur/);
+  assert.match(document.text,/Version 2026-08-28.2/);assert.match(document.text,/mentions de l’opérateur/);
   const head=await f.request(RULES.url,{method:'HEAD'});assert.equal(head.text,'');assert.equal(Number(head.headers['content-length']),document.bytes.length);
   for(const fields of [{},{acceptedRules:false,rulesVersion:RULES.version},{acceptedRules:'true',rulesVersion:RULES.version}]) {
     const denied=await f.request('/api/auth/register',{method:'POST',body:{username:'rules_register',password:PASSWORD,...fields}});
@@ -513,11 +526,11 @@ test('rules HTTP metadata identifies the exact served document and registration 
 test('encoded and repeated-slash rules paths serve the verified bytes, never a replaced disk document',async t=>{
   const publicDir=await mkdtemp(path.join(tmpdir(),'extras-rules-static-'));t.after(()=>rm(publicDir,{recursive:true,force:true}));
   await mkdir(path.join(publicDir,'rules'));
-  await writeFile(path.join(publicDir,RULES.url.slice(1)),'Synthetic modified document, not approved.');
+  for(const rule of RULE_DOCUMENTS)await writeFile(path.join(publicDir,rule.url.slice(1)),'Synthetic modified document, not approved.');
   const f=await fixture(t,{publicDir});
-  for(const pathname of [RULES.url,RULES.url.replace('/2026','/%32026'),RULES.url.replace('/rules/','/rules//')]) {
+  for(const rule of RULE_DOCUMENTS)for(const pathname of [rule.url,rule.url.replace('/2026','/%32026'),rule.url.replace('/rules/','/rules//')]) {
     const response=await f.request(pathname);assert.equal(response.status,200);
-    assert.equal(createHash('sha256').update(response.bytes).digest('hex'),RULES.sha256);
+    assert.equal(createHash('sha256').update(response.bytes).digest('hex'),rule.sha256);
   }
 });
 
@@ -555,4 +568,133 @@ test('an unaccepted account keeps account, reading and safety access but cannot 
   f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(f.owner.data.user.id);
   assert.equal((await f.request(post,{method:'DELETE',cookie:f.owner.cookie})).status,204);
   assert.equal((await f.request('/api/account',{method:'DELETE',cookie:f.guest.cookie,body:{password:PASSWORD}})).status,204);
+});
+
+async function presentationFixture(t,options={}) {
+ let calls=0;
+ const f=await fixture(t,{presentationSocketPath:'/tmp/test-presentation.sock',testPresentationProcessor:async()=>{calls++;return presentationPhoto();},...options});
+ const owner=await f.register('presentation_owner'),reader=await f.register('presentation_reader');
+ const post=(await f.request('/api/posts',{method:'POST',cookie:owner.cookie,body:input(),headers:{'Idempotency-Key':key()}})).data.post;
+ const send=(extra={})=>f.request('/api/presentation/photo',{method:'PUT',cookie:owner.cookie,rawBody:'synthetic image source',headers:{'Content-Type':'image/jpeg','X-Presentation-Revision':'0','Idempotency-Key':key()},...extra});
+ return {...f,owner,reader,post,send,calls:()=>calls};
+}
+
+test('presentation feature is absent by default and requires an operator socket, not a client flag',async t=>{
+ const f=await fixture(t),owner=await f.register('presentation_disabled');
+ assert.equal((await f.request('/api/session')).data.features,undefined);
+ for(const method of ['GET','PUT','DELETE'])assert.equal((await f.request('/api/presentation',{method,cookie:owner.cookie,headers:{'X-Presentation-Socket':'/tmp/untrusted'}})).status,404);
+ assert.equal(f.db.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name='app_presentations'").get().n,0);
+});
+
+test('presentation HTTP keeps drafts private, publishes deliberately, serves versioned ranges and hides closed posts',async t=>{
+ const f=await presentationFixture(t),route=`/api/posts/${f.post.id}/presentation`;
+ assert.equal((await f.request('/api/session',{cookie:f.owner.cookie})).data.features.presentation,true);
+ assert.equal((await f.request('/api/presentation')).status,401);
+ const intent=key(),headers={'Content-Type':'image/jpeg','X-Presentation-Revision':'0','Idempotency-Key':intent};
+ const uploaded=await f.send({headers});assert.equal(uploaded.status,201,uploaded.text);assert.equal(f.calls(),1);
+ assert.deepEqual((await f.send({headers})).data,uploaded.data);assert.equal(f.calls(),1);
+ assert.equal((await f.request(route)).status,404);assert.equal((await f.request('/api/state')).data.posts[0].presentationId,undefined);
+ assert.equal((await f.request('/api/presentation/photo?revision=1',{cookie:f.reader.cookie})).status,404);
+ const own=await f.request('/api/presentation/photo?revision=1',{cookie:f.owner.cookie});assert.deepEqual(own.bytes,presentationPhoto().bytes);
+ assert.equal((await f.request('/api/presentation/publish',{method:'POST',cookie:f.owner.cookie,body:{expectedRevision:1}})).status,400);
+ const published=await f.request('/api/presentation/publish',{method:'POST',cookie:f.owner.cookie,body:{expectedRevision:1,publicConsent:true}});assert.equal(published.status,200);
+ const version=published.data.publicationId;assert.equal((await f.request('/api/state')).data.posts[0].presentationId,version);
+ const publicData=(await f.request(route)).data;assert.equal(publicData.publicationId,version);assert.ok(!JSON.stringify(publicData).includes(f.owner.data.user.id));
+ const media=`${route}/photo?v=${version}`,range=await f.request(media,{headers:{Range:'bytes=2-4'}});assert.equal(range.status,206);assert.deepEqual(range.bytes,presentationPhoto().bytes.subarray(2,5));assert.equal(range.headers['cache-control'],'no-store');
+ assert.equal((await f.request(media,{headers:{'Sec-Fetch-Site':'cross-site'}})).status,403);
+ assert.equal((await f.request(`${route}/photo?v=old`)).status,404);
+ assert.equal((await f.request('/api/presentation/photo?revision=1',{cookie:f.owner.cookie})).status,404);
+ await f.request(`/api/posts/${f.post.id}/block`,{method:'POST',cookie:f.reader.cookie,body:{}});
+ assert.equal((await f.request(media,{cookie:f.reader.cookie})).status,404);assert.equal((await f.request(media)).status,200);
+ await f.request(`/api/posts/${f.post.id}`,{method:'PATCH',cookie:f.owner.cookie,body:{action:'close'},headers:{'Idempotency-Key':key()}});
+ assert.equal((await f.request(media)).status,404);assert.equal((await f.request(route)).status,404);
+});
+
+test('presentation conversion cannot store after logout, erasure, rules withdrawal or account deletion',async t=>{
+ for(const action of ['logout','erase','rules','delete']) {
+  let entered,release;const started=new Promise(resolve=>entered=resolve);
+  const f=await presentationFixture(t,{testPresentationProcessor:()=>{entered();return new Promise(resolve=>release=()=>resolve(presentationPhoto()));}});
+  const pending=f.send();await started;
+  try {
+   if(action==='logout')await f.request('/api/auth/logout',{method:'POST',cookie:f.owner.cookie,body:{}});
+   if(action==='erase')await f.request('/api/presentation',{method:'DELETE',cookie:f.owner.cookie,body:{expectedRevision:0}});
+   if(action==='rules')f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(f.owner.data.user.id);
+   if(action==='delete')await f.request('/api/account',{method:'DELETE',cookie:f.owner.cookie,body:{password:PASSWORD}});
+  }finally{release();}
+  assert.equal((await pending).status,action==='erase'?409:action==='rules'?403:401);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_presentation_assets').get().n,0);
+ }
+});
+
+test('presentation admission and early authorization reject extra uploads without calling the processor',async t=>{
+ let entered,release,calls=0;const started=new Promise(resolve=>entered=resolve);
+ const f=await presentationFixture(t,{testPresentationProcessor:async()=>{if(++calls===1){entered();await new Promise(resolve=>release=resolve);}return presentationPhoto();}});
+ assert.equal((await f.send({cookie:undefined})).status,401);assert.equal((await f.send({origin:false})).status,403);
+ assert.equal((await f.send({headers:{'Content-Type':'image/jpeg','X-Presentation-Revision':'-1','Idempotency-Key':key()}})).status,400);assert.equal(calls,0);
+ const pending=f.send();await started;try{assert.equal((await f.send()).status,429);assert.equal(calls,1);}finally{release();}
+ assert.equal((await pending).status,201);
+});
+
+test('database overflow rolls back media and its retry record, reports capacity, and preserves existing accounts',async t=>{
+ const bytes=Buffer.alloc(1024**2,1);bytes.writeUInt16BE(0xffd8,0);bytes.writeUInt16BE(0xffd9,bytes.length-2);
+ const f=await presentationFixture(t,{testPresentationProcessor:async()=>({...presentationPhoto(),bytes})});
+ const pages=f.db.prepare('PRAGMA page_count').get().page_count;f.db.exec(`PRAGMA max_page_count=${pages+4}`);
+ const refused=await f.send();assert.equal(refused.status,503);assert.equal(refused.data.error,'storage_capacity_reached');
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_presentation_assets').get().n,0);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_presentation_intents').get().n,0);
+ assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,2);assert.equal(f.db.prepare('PRAGMA integrity_check').get().integrity_check,'ok');
+ assert.equal((await f.request(`/api/posts/${f.post.id}`,{cookie:f.owner.cookie})).status,200);
+});
+
+test('presentation report media stay moderator-only, and account deletion erases their retained copies',async t=>{
+ const f=await presentationFixture(t);await f.send();
+ const publicationId=(await f.request('/api/presentation/publish',{method:'POST',cookie:f.owner.cookie,body:{expectedRevision:1,publicConsent:true}})).data.publicationId;
+ const report=await f.request('/api/reports',{method:'POST',cookie:f.reader.cookie,body:{targetType:'post',targetId:f.post.id,reason:'unsafe',presentationId:publicationId},headers:{'Idempotency-Key':key()}});assert.equal(report.status,201);
+ const route=`/api/moderation/reports/${report.data.id}/presentation/photo`;
+ assert.equal((await f.request(route,{cookie:f.reader.cookie})).status,403);f.app.store.moderators.add(f.reader.data.user.id);
+ assert.equal((await f.request(route,{cookie:f.reader.cookie})).status,200);
+ const resolved=await f.request(`/api/moderation/reports/${report.data.id}`,{method:'POST',cookie:f.reader.cookie,body:{action:'remove-presentation'}});assert.equal(resolved.status,200);
+ assert.equal((await f.request(`/api/posts/${f.post.id}/presentation`)).status,404);
+ assert.equal((await f.request(route,{cookie:f.reader.cookie})).status,200);
+ await f.request('/api/account',{method:'DELETE',cookie:f.owner.cookie,body:{password:PASSWORD}});
+ assert.equal((await f.request(route,{cookie:f.reader.cookie})).status,404);
+});
+
+test('real photo/video cross HTTP and the Unix worker, then encrypted backup restores published, draft and report media',async t=>{
+ if(!['ffmpeg','ffprobe'].every(binary=>spawnSync(binary,['-version'],{timeout:3000,stdio:'ignore'}).status===0)){t.skip('Existing FFmpeg unavailable; no installation attempted');return;}
+ const directory=await mkdtemp('/tmp/tse-media-e2e-'),socketPath=path.join(directory,'worker.sock'),databasePath=path.join(directory,'source.sqlite');
+ const execute=promisify(execFile),photoPath=path.join(directory,'source.png'),videoPath=path.join(directory,'source.mp4');
+ const worker=createPresentationWorker({normalizePhoto:createImageNormalizer({tempRoot:directory}),normalizeVideo:createVideoNormalizer({tempRoot:directory})});
+ await new Promise(resolve=>worker.listen(socketPath,resolve));
+ const f=await fixture(t,{databasePath,presentationSocketPath:socketPath,sweepIntervalMs:60000,heartbeatIntervalMs:60000});
+ // Close the application before removing its private directory, independently
+ // of native test hook ordering; fixture.close is deliberately idempotent.
+ t.after(async()=>{await f.app.close();worker.closeAllConnections();await new Promise(resolve=>worker.close(resolve));if(f.db.isOpen)f.db.close();await rm(directory,{recursive:true,force:true});});
+ await execute('ffmpeg',['-v','error','-nostdin','-f','lavfi','-i','color=c=lime:s=80x40','-frames:v','1','-threads','1','-metadata','comment=SYNTHETIC_PRIVATE_SOURCE',photoPath],{timeout:10000,maxBuffer:32768});
+ await execute('ffmpeg',['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=80x40:rate=30:duration=0.4','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=0.4','-c:v','libx264','-threads','1','-preset','ultrafast','-bf','0','-pix_fmt','yuv420p','-c:a','aac','-metadata','comment=SYNTHETIC_PRIVATE_SOURCE',videoPath],{timeout:10000,maxBuffer:32768});
+ const owner=await f.register('real_media_owner'),reader=await f.register('real_media_reader'),sourcePhoto=await readFile(photoPath),sourceVideo=await readFile(videoPath);
+ const post=(await f.request('/api/posts',{method:'POST',cookie:owner.cookie,body:input(),headers:{'Idempotency-Key':key()}})).data.post;
+ async function send(kind,bytes,type,revision){const r=await f.request(`/api/presentation/${kind}`,{method:'PUT',cookie:owner.cookie,rawBody:bytes,headers:{'Content-Type':type,'X-Presentation-Revision':String(revision),'Idempotency-Key':key()}});assert.equal(r.status,201,r.text);return r.data.presentation;}
+ await send('photo',sourcePhoto,'image/png',0);await send('video',sourceVideo,'video/mp4',1);
+ const saved=await f.request('/api/presentation',{method:'PATCH',cookie:owner.cookie,body:{expectedRevision:2,bio:'Présentation synthétique.',videoText:'Motif abstrait et son synthétique.'}});assert.equal(saved.status,200);
+ const publication=await f.request('/api/presentation/publish',{method:'POST',cookie:owner.cookie,body:{expectedRevision:3,publicConsent:true}});assert.equal(publication.status,200);
+ const publicVideo=await f.request(`/api/posts/${post.id}/presentation/video?v=${publication.data.publicationId}`);assert.equal(publicVideo.status,200);assert.ok(!publicVideo.bytes.includes(Buffer.from('SYNTHETIC_PRIVATE_SOURCE')));
+ const publicPhoto=await f.request(`/api/posts/${post.id}/presentation/photo?v=${publication.data.publicationId}`);assert.equal(publicPhoto.headers['content-type'],'image/jpeg');
+ await send('photo',sourcePhoto,'image/png',4); // Distinct private replacement; published references remain intact.
+ const reported=await f.request('/api/reports',{method:'POST',cookie:reader.cookie,body:{targetType:'post',targetId:post.id,reason:'other',presentationId:publication.data.publicationId},headers:{'Idempotency-Key':key()}});assert.equal(reported.status,201);
+ const snapshot=path.join(directory,'snapshot.sqlite'),encrypted=path.join(directory,'snapshot.tseb'),restoredPath=path.join(directory,'restored.sqlite');
+ await createBackup(databasePath,snapshot);const encryptionKey=await backupKey(path.join(directory,'key'),{create:true});
+ try{await encryptBackup(snapshot,encrypted,encryptionKey);await decryptBackup(encrypted,restoredPath,encryptionKey);}finally{encryptionKey.fill(0);}
+ // Erase only the synthetic live account, then prove the isolated point still
+ // contains its older version and explicitly replay its post-snapshot erasure.
+ assert.equal((await f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}})).status,204);
+ const restored=openDatabase(restoredPath);
+ try {
+  const auth=new AuthService({db:restored}),store=new ProductionStore({db:restored,clock:()=>1800000000000,moderators:[reader.data.user.id],hasAcceptedRules:id=>auth.hasAcceptedRules(id)}),presentations=new PresentationStore({db:restored,store,clock:()=>1800000000000});
+  assert.equal(presentations.own(owner.data.user.id).revision,5);assert.equal(restored.prepare('SELECT COUNT(*) n FROM app_presentation_assets').get().n,3);
+  assert.deepEqual(presentations.assetForPost(post.id,'video').bytes,publicVideo.bytes);assert.deepEqual(presentations.assetForPost(post.id,'photo').bytes,publicPhoto.bytes);
+  assert.deepEqual(presentations.reportAsset(reader.data.user.id,reported.data.id,'video').bytes,publicVideo.bytes);
+  store.transaction(()=>{store.eraseAccountData(owner.data.user.id);auth.deleteAccount(owner.data.user.id);});
+  for(const table of ['app_presentations','app_presentation_assets','app_presentation_intents','app_report_presentations','app_report_presentation_assets'])assert.equal(restored.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n,0);
+  assert.equal(restored.prepare('PRAGMA integrity_check').get().integrity_check,'ok');
+ }finally{restored.close();}
 });

@@ -1,0 +1,46 @@
+[Unit]
+Description=thesocialextra isolated photo and video processor
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=thesocialextra-presentation
+Group=thesocialextra
+WorkingDirectory=/srv/thesocialextra/current
+Environment=PRESENTATION_SOCKET=/run/thesocialextra-presentation/worker.sock
+ExecStart=/usr/bin/node --max-old-space-size=96 presentation-worker.mjs
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+RuntimeDirectory=thesocialextra-presentation
+RuntimeDirectoryMode=0750
+# Separate, bounded temporary mounts; no source files persist across a restart.
+TemporaryFileSystem=/tmp:rw,size=96M,mode=1777 /var/tmp:rw,size=8M,mode=1777
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+InaccessiblePaths=/var/lib/thesocialextra /etc/thesocialextra /var/backups/thesocialextra /etc/thesocialextra-backup
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=512M
+MemorySwapMax=0
+CPUQuota=50%
+TasksMax=32
+LimitNOFILE=128
+LimitFSIZE=24M
+
+[Install]
+WantedBy=multi-user.target

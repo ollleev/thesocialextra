@@ -106,7 +106,7 @@ export class ProductionStore {
       db.exec(`CREATE INDEX IF NOT EXISTS app_blocks_page ON app_blocks(blocker_id,created_at DESC,id DESC);
         CREATE INDEX IF NOT EXISTS app_blocks_target ON app_blocks(blocked_id,blocker_id);`);
       db.exec('COMMIT');
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    } catch (error) { if(db.isTransaction)db.exec('ROLLBACK'); throw error; }
     // Attribution must survive moderation or normal expiry of the target. An
     // older report can be backfilled only while its post/thread still exists.
     // Never guess ownership from message text, or silently delete old evidence.
@@ -132,7 +132,7 @@ export class ProductionStore {
       changedUsers = [...this.privateChanged];
       if (changed) this.db.exec('UPDATE app_meta SET version=version+1 WHERE id=1');
       this.db.exec('COMMIT');
-    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    } catch (error) { if(this.db.isTransaction)this.db.exec('ROLLBACK'); throw error; }
     finally { this.transactionDepth = 0; this.publicChanged = false; this.privateChanged.clear(); }
     if (changed) for (const fn of this.listeners) { try { fn(); } catch { /* A dead subscriber cannot roll back a committed write. */ } }
     for (const userId of changedUsers) for (const fn of this.privateListeners) { try { fn(userId); } catch { /* The write is already committed. */ } }
@@ -147,6 +147,7 @@ export class ProductionStore {
       // The existing, disclosed 30-day retention applies regardless of status.
       // Capacity pressure never advances this deadline or evicts an open report.
       this.db.prepare('DELETE FROM app_reports WHERE created_at<=?').run(now - REPORT_RETENTION_MS);
+      this.presentations?.sweep(now);
       this.publicChanged ||= expired > 0;
       return expired > 0;
     });
@@ -222,15 +223,17 @@ export class ProductionStore {
       (zone==='all'||post.zoneId===zone)&&(!english||post.english)&&(!vehicle||post.vehicle))
       .sort((a,b)=>(sort==='oldest'?a.createdAt-b.createdAt:b.createdAt-a.createdAt)||a.id.localeCompare(b.id));
     const meta=this.db.prepare('SELECT epoch,version FROM app_meta WHERE id=1').get();
-    return { posts:candidates.slice(0,200).map(publicPost), now, mode:'production', ...meta,
+    const snapshot={ posts:candidates.slice(0,200).map(publicPost), now, mode:'production', ...meta,
       scope:JSON.stringify({cityId,point:point??null,mine,kind,role,zone,english,vehicle,sort}), total:candidates.length, counts, truncated:candidates.length>200,
       ...(userId?{feedRevision:this.feedRevision(userId),ownedPostIds:this.db.prepare('SELECT id FROM app_posts WHERE owner_id=? AND expires_at>?').all(userId,now).map(row=>row.id),ownedPosts:this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 10').all(userId,now).map(parse).map(publicPost)}:{}) };
+    return this.presentations?this.presentations.decorate(snapshot):snapshot;
   }
   getPublicPost(id, userId=null) {
     const row=this.postRow(id);
     if(userId && this.blockedBy(userId,row.owner_id)) fail(404,'post_not_found');
     if(row.expires_at<=this.clock()) fail(410,'post_expired');
-    return { post:publicPost(parse(row)), ...(userId?{feedRevision:this.feedRevision(userId)}:{}) };
+    const snapshot={ post:publicPost(parse(row)), ...(userId?{feedRevision:this.feedRevision(userId)}:{}) };
+    return this.presentations?this.presentations.decorate(snapshot):snapshot;
   }
   create(userId,input,key) {
     this.ugcWriter(userId); const data=validatePost(input); this.sweep();
@@ -501,7 +504,8 @@ export class ProductionStore {
     }
   }
   report(userId,input,key) {
-    this.actor(userId); fields(input,['targetType','targetId','reason','details']);
+    this.actor(userId); fields(input,['targetType','targetId','reason','details',...(this.presentations?['presentationId']:[])]);
+    if(input.presentationId!==undefined&&(input.targetType!=='post'||typeof input.presentationId!=='string'||!/^[a-zA-Z0-9-]{1,80}$/.test(input.presentationId)))fail(400,'invalid_report');
     if(!['post','thread'].includes(input.targetType) || typeof input.targetId!=='string' || input.targetId.length>80 || !['spam','harassment','unsafe','other'].includes(input.reason)) fail(400,'invalid_report');
     const details=text(input.details,500),targetId=input.targetId;
     // Authorize before looking up cached intents, but avoid loading a whole
@@ -530,13 +534,14 @@ export class ProductionStore {
       for(const subject of subjects) this.db.prepare('INSERT INTO app_report_subjects(report_id,user_id) VALUES(?,?)').run(id,subject);
       for(const messageId of voices) this.db.prepare(`INSERT INTO app_report_voices(report_id,message_id,duration_ms,bytes)
         SELECT ?,message_id,duration_ms,bytes FROM app_voices WHERE message_id=?`).run(id,messageId);
+      if(input.presentationId!==undefined)this.presentations.attachReportEvidence(id,targetId,input.presentationId,userId);
       return {id,status:'open'};
     }));
   }
   listReports(userId) { if(!this.moderators.has(userId)) fail(403,'moderator_required'); return this.db.prepare("SELECT * FROM app_reports WHERE status='open' ORDER BY created_at LIMIT 100").all(); }
   resolveReport(userId,id,action) {
     if(!this.moderators.has(userId)) fail(403,'moderator_required');
-    if(!['dismiss','remove'].includes(action)) fail(400,'invalid_action');
+    if(!['dismiss','remove',...(this.presentations?['remove-presentation']:[])].includes(action)) fail(400,'invalid_action');
     return this.transaction(()=>{
       const report=this.db.prepare('SELECT * FROM app_reports WHERE id=?').get(id); if(!report) fail(404,'report_not_found');
       if(report.status!=='open') return {id,status:report.status};
@@ -544,6 +549,7 @@ export class ProductionStore {
         if(report.target_type==='post') { this.deletePost(report.target_id); this.publicChanged=true; }
         else this.deleteThread(report.target_id);
       }
+      if(action==='remove-presentation')this.presentations.removeReportedPresentation(userId,id);
       const status=action==='dismiss'?'dismissed':'removed';
       this.db.prepare('UPDATE app_reports SET status=?,resolved_at=?,moderator_id=? WHERE id=?').run(status,this.clock(),userId,id);
       return {id,status};
