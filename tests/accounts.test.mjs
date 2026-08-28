@@ -277,3 +277,123 @@ test('acceptance updates only rules and invalidates an older pending session rea
   request.respond({...original,rules:{...RULES,accepted:false}});await old;
   assert.deepEqual(f.ui.session,{...original,rules:accepted});
 });
+
+test('mode transitions recompute submit disabled from busy and rules availability', async t => {
+  const f = fixture(t); await f.initialize(null);
+  f.ui.show('register');
+  assert.equal(f.get('account-submit').disabled, false);
+  const read = f.ui.refresh();
+  (await f.next('/api/session')).respond({ mode: 'production', user: null, ownership: [], moderator: false });
+  await read;
+  assert.equal(f.get('account-submit').disabled, true);
+  await f.modes.find(button => button.dataset.authMode === 'login').fire('click');
+  assert.equal(f.get('account-submit').disabled, false);
+  await f.modes.find(button => button.dataset.authMode === 'recover').fire('click');
+  assert.equal(f.get('account-submit').disabled, false);
+  await f.modes.find(button => button.dataset.authMode === 'register').fire('click');
+  assert.equal(f.get('account-submit').disabled, true);
+});
+
+test('logout clears identity immediately and retains valid public rules metadata with accepted false', async t => {
+  const f = fixture(t); await f.initialize(USER); f.ui.show();
+  f.failReads();
+  const logout = f.get('logout').fire('click');
+  (await f.next('/api/auth/logout')).respond({ user: null });
+  await logout;
+  assert.equal(f.ui.session.user, null);
+  assert.deepEqual(f.ui.session, { mode: 'production', user: null, ownership: [], moderator: false, rules: { ...RULES, accepted: false } });
+  f.ui.show('register');
+  assert.equal(f.get('account-submit').disabled, false);
+  assert.equal(f.get('account-terms').disabled, false);
+  assert.equal(f.get('account-rules-link').hidden, false);
+  assert.equal(f.get('account-terms').checked, false);
+});
+
+test('deletion clears identity immediately and retains valid public rules metadata with accepted false', async t => {
+  const f = fixture(t); await f.initialize(USER); f.ui.show();
+  f.get('delete-password').value = PASSWORD; f.get('delete-confirm').checked = true;
+  f.failReads();
+  const deletion = f.get('delete-account-form').fire('submit');
+  (await f.next('/api/account')).respond({}, 204);
+  await deletion;
+  assert.equal(f.ui.session.user, null);
+  assert.deepEqual(f.ui.session, { mode: 'production', user: null, ownership: [], moderator: false, rules: { ...RULES, accepted: false } });
+  f.ui.show('register');
+  assert.equal(f.get('account-submit').disabled, false);
+  assert.equal(f.get('account-terms').checked, false);
+});
+
+test('new login missing rules exercises actual auth submit with failed follow-up read and asserts session rules null', async t => {
+  const f = fixture(t); await f.initialize(null);
+  f.fill('login');
+  f.failReads();
+  const operation = f.get('account-form').fire('submit');
+  (await f.next('/api/auth/login')).respond({ user: USER });
+  await operation;
+  assert.deepEqual(f.ui.session.user, USER);
+  assert.equal(f.ui.session.rules, null);
+});
+
+test('logout drops enriched account state and a late read cannot restore it', async t => {
+  const f = fixture(t), enriched = { ...session(USER), ownership: ['synthetic-owned-post'], moderator: true,
+    features: { voice: true, presentation: true }, privateSelection: { id: 'synthetic-selection' } };
+  const initial = f.ui.refresh(); (await f.next('/api/session')).respond(enriched); await initial;
+  const older = f.ui.refresh(), stale = await f.next('/api/session');
+  f.ui.show(); const logout = f.get('logout').fire('click');
+  (await f.next('/api/auth/logout')).respond({ user: null }); await logout;
+  const anonymous = { mode: 'production', user: null, ownership: [], moderator: false, rules: { ...RULES, accepted: false } };
+  assert.deepEqual(f.ui.session, anonymous);
+  assert.deepEqual(f.applied.at(-1), anonymous);
+  assert.ok(f.buttons.every(button => button.disabled === false), 'all dialog buttons unlock after confirmed logout');
+  stale.respond(enriched); await older;
+  assert.deepEqual(f.ui.session, anonymous);
+  assert.deepEqual(f.applied.at(-1), anonymous);
+  f.ui.show('register');
+  assert.equal(f.get('account-terms').checked, false);
+  const before = f.calls.length;
+  await f.get('account-form').fire('submit');
+  assert.equal(f.calls.length, before, 'public metadata never substitutes for explicit agreement');
+});
+
+test('logout discards malformed rule metadata and registration remains closed', async t => {
+  const cases = [
+    ['external URL', { ...RULES, url: 'https://example.invalid/rules' }],
+    ['invalid digest', { ...RULES, sha256: 'invalid' }],
+    ['invalid version', { ...RULES, version: '../invalid' }],
+    ['missing metadata', undefined],
+  ];
+  for (const [name, rules] of cases) await t.test(name, async t => {
+    const f = fixture(t), initial = f.ui.refresh();
+    (await f.next('/api/session')).respond({ ...session(USER), rules }); await initial;
+    f.ui.show(); const logout = f.get('logout').fire('click');
+    (await f.next('/api/auth/logout')).respond({ user: null }); await logout;
+    assert.equal(f.ui.session.rules, null);
+    f.ui.show('register');
+    assert.equal(f.get('account-submit').disabled, true);
+    assert.equal(f.get('account-terms').disabled, true);
+    assert.equal(f.get('account-rules-link').hidden, true);
+    assert.equal(f.get('account-rules-link').attributes.has('href'), false);
+    f.get('account-terms').checked = true;
+    const before = f.calls.length; await f.get('account-form').fire('submit');
+    assert.equal(f.calls.length, before);
+  });
+});
+
+test('busy auth stays locked through rule updates and duplicate actions, then recomputes the mode gate', async t => {
+  const f = fixture(t); await f.initialize(null); f.fill('login');
+  const operation = f.get('account-form').fire('submit'), request = await f.next('/api/auth/login');
+  f.ui.updateRules(null);
+  assert.ok(f.buttons.every(button => button.disabled));
+  await f.modes.find(button => button.dataset.authMode === 'register').fire('click');
+  await f.get('account-form').fire('submit');
+  await f.get('logout').fire('click');
+  assert.equal(f.get('account-submit').textContent, 'Se connecter');
+  assert.equal(f.calls.filter(call => call.method === 'POST').length, 1);
+  request.respond({ error: 'invalid_credentials' }, 401); await operation;
+  assert.equal(f.get('account-submit').disabled, false);
+  assert.ok(f.buttons.every(button => button.disabled === false), 'all dialog buttons unlock after a failed login');
+  await f.modes.find(button => button.dataset.authMode === 'register').fire('click');
+  assert.equal(f.get('account-submit').disabled, true);
+  await f.modes.find(button => button.dataset.authMode === 'recover').fire('click');
+  assert.equal(f.get('account-submit').disabled, false);
+});

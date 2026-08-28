@@ -15,7 +15,7 @@ export function createAccountUI({ openDialog, onChange, onError }) {
     if(next)$('#account-rules-link').setAttribute('href',next.url);else $('#account-rules-link').removeAttribute('href');
     $('#account-rules-version').textContent=next?`Version ${next.version}`:'Règles indisponibles. Fermez puis réessayez après actualisation.';
     $('#account-terms').disabled=!next;
-    if(mode==='register')$('#account-submit').disabled=busy||!next;
+    $('#account-submit').disabled=busy||(mode==='register'&&!next);
   }
   const labels = {
     login: ['Heureux de vous revoir.', 'Connectez-vous pour retrouver vos annonces et vos échanges.', 'Se connecter'],
@@ -77,13 +77,16 @@ export function createAccountUI({ openDialog, onChange, onError }) {
     return session;
   }
   async function applyAuthResult(user,rules) {
-    ++readRevision;session={mode:'production',user,ownership:[],moderator:false,rules:rulesMetadata(rules)};syncRules();
+    ++readRevision;
+    if(user)session={mode:'production',user,ownership:[],moderator:false,rules:rulesMetadata(rules)};
+    else{const publicRules=rulesMetadata(session.rules);session={mode:'production',user:null,ownership:[],moderator:false,rules:publicRules?{...publicRules,accepted:false}:null};}
+    syncRules();
     await onChange(session);
   }
   function setBusy(value) {
     busy = value;
     dialog.querySelectorAll('button').forEach(button => { button.disabled = value; });
-    if(!value&&mode==='register'&&!registrationRules)$('#account-submit').disabled=true;
+    if(!value)$('#account-submit').disabled=mode==='register'&&!registrationRules;
   }
   function finish() {
     $('#recovery-code').value = '';
