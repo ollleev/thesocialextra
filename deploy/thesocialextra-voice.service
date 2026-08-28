@@ -1,0 +1,45 @@
+[Unit]
+Description=thesocialextra isolated private audio transcoder
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=thesocialextra-voice
+Group=thesocialextra
+WorkingDirectory=/srv/thesocialextra/current
+Environment=VOICE_SOCKET=/run/thesocialextra-voice/worker.sock
+ExecStart=/usr/bin/node --max-old-space-size=64 voice-worker.mjs
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+RuntimeDirectory=thesocialextra-voice
+RuntimeDirectoryMode=0750
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+InaccessiblePaths=/var/lib/thesocialextra /etc/thesocialextra
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=50%
+TasksMax=24
+LimitNOFILE=128
+LimitFSIZE=8M
+
+[Install]
+WantedBy=multi-user.target

@@ -9,6 +9,8 @@ import { searchLocations, nearestLocation, getLocation, LocationError } from './
 import { AuthService } from './auth.mjs';
 import { ProductionStore } from './production-store.mjs';
 import { openDatabase } from './database.mjs';
+import { readVoiceBody, sendVoice } from './voice-http.mjs';
+import { normalizeViaWorker } from './voice-worker.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MUTATING = new Set(['POST', 'PATCH', 'DELETE', 'PUT']);
@@ -23,12 +25,12 @@ function configuredOrigin(value, allowLocalHttp) {
   if (url.protocol !== 'https:' && !local) throw new TypeError('HTTPS required outside explicit local HTTP mode');
   return { url, secure: !local };
 }
-function securityHeaders(res, secure) {
+function securityHeaders(res, secure, voiceEnabled) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('Permissions-Policy', 'geolocation=(self), camera=(), microphone=()');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://tile.openstreetmap.org; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+  res.setHeader('Permissions-Policy', `geolocation=(self), camera=(), microphone=(${voiceEnabled ? 'self' : ''})`);
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://tile.openstreetmap.org; connect-src 'self'; media-src 'self' blob:; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   res.setHeader('Cache-Control', 'no-store');
   if (secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
 }
@@ -81,11 +83,15 @@ function scopeFrom(params) {
 
 /** HTTPS terminates at the configured reverse proxy; never expose this listener directly. */
 export function createProductionServer({ db, publicOrigin, publicDir=path.join(HERE,'public'), clock=Date.now,
-  authOptions={}, moderators=[], allowLocalHttp=false, trustedProxyAddresses=[],
+  authOptions={}, moderators=[], allowLocalHttp=false, trustedProxyAddresses=[], voiceSocketPath=null, testVoiceProcessor,
   rateLimit=240, mutationRateLimit=60, accountRateLimit=120, authRateLimit=15, authAccountRateLimit=10,
   rateWindowMs=60_000, authWindowMs=15*60_000, rateMaxEntries=10000,
   maxStreams=256, maxStreamsPerIp=8, sweepIntervalMs=1000, heartbeatIntervalMs=15_000 }={}) {
   const {url:origin,secure}=configuredOrigin(publicOrigin,allowLocalHttp);
+  if(voiceSocketPath!==null && (typeof voiceSocketPath!=='string'||!path.isAbsolute(voiceSocketPath)||voiceSocketPath.length>100||/[\0\r\n]/.test(voiceSocketPath))) throw new TypeError('A trusted absolute voice socket is required');
+  if(testVoiceProcessor!==undefined && (!process.env.NODE_TEST_CONTEXT || typeof testVoiceProcessor!=='function')) throw new TypeError('Voice injection is for the native test runner only');
+  const processVoice=testVoiceProcessor??((bytes,options)=>normalizeViaWorker(bytes,{...options,socketPath:voiceSocketPath}));
+  let voiceAdmitted=false;
   for(const value of [rateLimit,mutationRateLimit,accountRateLimit,authRateLimit,authAccountRateLimit,rateWindowMs,authWindowMs,rateMaxEntries,maxStreams,maxStreamsPerIp,sweepIntervalMs,heartbeatIntervalMs])
     if(!Number.isSafeInteger(value)||value<1) throw new TypeError('Limits and intervals must be positive integers');
   const trusted=new Set(trustedProxyAddresses.map(normalizeIp));
@@ -147,9 +153,9 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
   }
   const unsubscribe=store.subscribe(scheduleState);
   const server=http.createServer(async(req,res)=>{
-    securityHeaders(res,secure);
+    securityHeaders(res,secure,Boolean(voiceSocketPath));
     try {
-      const singletonHeaders=new Set(['host','origin','cookie','idempotency-key']),seenHeaders=new Set();
+      const singletonHeaders=new Set(['host','origin','cookie','idempotency-key','content-type','content-length','content-encoding','transfer-encoding']),seenHeaders=new Set();
       for(let i=0;i<req.rawHeaders.length;i+=2){const name=req.rawHeaders[i].toLowerCase();if(singletonHeaders.has(name)&&seenHeaders.has(name))fail(400,'duplicate_header');seenHeaders.add(name);}
       if(req.headers.host!==origin.host) fail(403,'invalid_host');
       if(!req.url?.startsWith('/')||req.url.startsWith('//')||req.url.length>4096) fail(400,'invalid_path');
@@ -166,7 +172,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       // while a slow request was uploading. Never authorize writes from stale user data.
       const currentUserId=()=>requireUser(auth.session(token));
       if(user&&pathname.startsWith('/api/')) rate(`account:${user.id}`,accountRateLimit);
-      if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id))});
+      if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id)),...(voiceSocketPath?{features:{voice:true}}:{})});
       const authRoute=pathname.match(/^\/api\/auth\/(register|login|recover|logout)$/);
       if(req.method==='POST'&&authRoute) {
         const action=authRoute[1];if(action!=='logout')rate(`auth-ip:${ip}`,authRateLimit,authWindowMs);
@@ -225,10 +231,31 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
           return json(res,200,{threads:rows.map(({id:threadId})=>{const {messages,...thread}=store.readThread(actor,threadId).thread;return {...thread,messageCount:messages.length,role:post.role,zoneLabel:post.zoneLabel,timezone:post.timezone};})});
         }
       }
-      const threadRoute=pathname.match(/^\/api\/threads\/([a-zA-Z0-9-]{1,80})(?:\/(messages|block))?$/);
+      const voiceRoute=pathname.match(/^\/api\/voice\/([a-zA-Z0-9-]{1,80})$/);
+      if(req.method==='GET'&&voiceRoute) return sendVoice(res,store.getVoice(requireUser(user),voiceRoute[1]));
+      const reportVoiceRoute=pathname.match(/^\/api\/moderation\/reports\/([a-zA-Z0-9-]{1,80})\/voice\/([a-zA-Z0-9-]{1,80})$/);
+      if(req.method==='GET'&&reportVoiceRoute) return sendVoice(res,store.getReportVoice(requireUser(user),reportVoiceRoute[1],reportVoiceRoute[2]));
+      const threadRoute=pathname.match(/^\/api\/threads\/([a-zA-Z0-9-]{1,80})(?:\/(messages|block|voice))?$/);
       if(threadRoute) {
         const [,id,operation]=threadRoute,actor=requireUser(user);
         if(req.method==='GET'&&!operation)return json(res,200,store.readThread(actor,id));
+        if(req.method==='POST'&&operation==='voice') {
+          if(!voiceSocketPath)fail(404,'route_not_found');
+          const key=intentKey(req);
+          store.writer(actor);
+          const thread=store.threadAccess(actor,id);
+          if(store.blocked(thread.owner_id,thread.guest_id))fail(403,'contact_blocked');
+          if(voiceAdmitted)fail(429,'audio_busy');
+          voiceAdmitted=true;
+          try {
+            const source=await readVoiceBody(req), metadata={sourceHash:hash(source.bytes),contentType:source.contentType};
+            const replay=store.prepareVoice(currentUserId(),id,metadata,key);
+            if(replay)return json(res,201,replay);
+            const normalized=await processVoice(source.bytes,{contentType:source.contentType});
+            if(req.aborted||res.destroyed)return;
+            return json(res,201,store.addVoiceMessage(currentUserId(),id,{...metadata,bytes:normalized.bytes,durationMs:normalized.durationMs},key));
+          } finally {voiceAdmitted=false;}
+        }
         if(req.method==='POST'&&operation==='messages') { const key=intentKey(req),input=await body(req);return json(res,201,store.addMessage(currentUserId(),id,input,key)); }
         if(req.method==='POST'&&operation==='block') { const input=await body(req);fields(input,['blocked']);if(typeof input.blocked!=='boolean')fail(400,'invalid_block');return json(res,200,store.block(currentUserId(),id,input.blocked)); }
       }
@@ -270,7 +297,7 @@ if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.ur
   if(allowLocalHttp&&!['127.0.0.1','localhost','::1'].includes(host))throw new Error('Local HTTP must bind loopback');
   if(!process.env.DATABASE_PATH||!path.isAbsolute(process.env.DATABASE_PATH))throw new Error('An absolute DATABASE_PATH is required');
   const db=openDatabase(process.env.DATABASE_PATH);
-  let app;try{app=createProductionServer({db,publicOrigin,allowLocalHttp,moderators:(process.env.MODERATOR_IDS||'').split(',').filter(Boolean),trustedProxyAddresses:(process.env.TRUSTED_PROXY_IPS||'').split(',').filter(Boolean)});}catch(error){db.close();throw error;}
+  let app;try{app=createProductionServer({db,publicOrigin,allowLocalHttp,voiceSocketPath:process.env.VOICE_SOCKET||null,moderators:(process.env.MODERATOR_IDS||'').split(',').filter(Boolean),trustedProxyAddresses:(process.env.TRUSTED_PROXY_IPS||'').split(',').filter(Boolean)});}catch(error){db.close();throw error;}
   app.server.on('error',error=>{console.error(`Production server startup failed: ${error.code||'unknown_error'}`);app.close().finally(()=>db.close());process.exitCode=1;});
   app.server.listen(port,host,()=>console.log('Production listener ready; use the configured public origin.'));
   for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>{app.close().then(()=>db.close()).catch(()=>{process.exitCode=1;});});

@@ -23,7 +23,7 @@ async function fixture(t,options={}) {
     const payload=rawBody??(body===undefined?undefined:JSON.stringify(body));
     const all={Host:new URL(publicOrigin).host,...(method!=='GET'&&method!=='HEAD'&&origin?{Origin:publicOrigin}:{}),...(cookie?{Cookie:cookie}:{}),...(payload!==undefined?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}:{}),...headers};
     return new Promise((resolve,reject)=>{
-      const req=http.request({hostname:'127.0.0.1',port,path:url,method,headers:all},res=>{const chunks=[];res.on('data',x=>chunks.push(x));res.on('end',()=>{const text=Buffer.concat(chunks).toString();let data;try{data=JSON.parse(text);}catch{}resolve({status:res.statusCode,headers:res.headers,text,data,cookie:res.headers['set-cookie']?.[0]?.split(';')[0]});});});
+      const req=http.request({hostname:'127.0.0.1',port,path:url,method,headers:all},res=>{const chunks=[];res.on('data',x=>chunks.push(x));res.on('end',()=>{const bytes=Buffer.concat(chunks),text=bytes.toString();let data;try{data=JSON.parse(text);}catch{}resolve({status:res.statusCode,headers:res.headers,bytes,text,data,cookie:res.headers['set-cookie']?.[0]?.split(';')[0]});});});
       req.on('error',reject);req.end(payload);
     });
   }
@@ -207,4 +207,107 @@ test('HTTP session expires exactly at its deadline and duplicate sensitive heade
   assert.equal((await f.request('/api/session',{cookie:owner.cookie})).data.user,null);
   assert.equal((await f.request('/api/posts',{method:'POST',cookie:owner.cookie,body:input(),headers:{'Idempotency-Key':key()}})).status,401);
   const result=await new Promise((resolve,reject)=>{const req=http.request({hostname:'127.0.0.1',port:f.app.server.address().port,path:'/api/state',headers:['Host','extras.test','Host','attacker.test']},res=>{res.resume();res.on('end',()=>resolve(res.statusCode));});req.on('error',reject);req.end();});assert.equal(result,400);
+});
+
+// Transport/authorization fixtures only. The codec is exercised with real files
+// in audio-processing.test.mjs; this stub must never be enabled outside node:test.
+const normalizedVoice=()=>({bytes:Buffer.concat([Buffer.from('OggS'),Buffer.alloc(40)]),durationMs:1000,contentType:'audio/ogg; codecs=opus'});
+async function voiceFixture(t,options={}) {
+  let calls=0;
+  const f=await fixture(t,{voiceSocketPath:'/tmp/test-private-voice.sock',testVoiceProcessor:async()=>{calls++;return normalizedVoice();},...options});
+  const owner=await f.register('voice_owner'),guest=await f.register('voice_guest'),other=await f.register('voice_other');
+  const post=f.app.store.create(owner.data.user.id,input(),key()).post;
+  const chat=f.app.store.contact(guest.data.user.id,post.id,{message:'Synthetic initial contact.'},key());
+  const route=`/api/threads/${chat.threadId}/voice`;
+  const send=(extra={})=>f.request(route,{method:'POST',cookie:owner.cookie,rawBody:Buffer.from('synthetic browser bytes'),headers:{'Content-Type':'audio/webm; codecs=opus','Idempotency-Key':key()},...extra});
+  return {...f,owner,guest,other,post,chat,route,send,calls:()=>calls};
+}
+
+test('voice is disabled without an operator socket and cannot be switched on through request data',async t=>{
+  const f=await fixture(t),user=await f.register('voice_disabled');
+  assert.equal((await f.request('/api/session')).data.features,undefined);
+  const r=await f.request('/api/threads/unknown/voice',{method:'POST',cookie:user.cookie,rawBody:'synthetic',headers:{'Content-Type':'audio/webm','Idempotency-Key':key(),'X-Voice-Socket':'/tmp/attacker.sock'}});
+  assert.equal(r.status,404);assert.match(r.headers['permissions-policy'],/microphone=\(\)/);
+});
+
+test('voice HTTP stores once, serves only participants and never returns bytes in JSON',async t=>{
+  const f=await voiceFixture(t),intent=key(),headers={'Content-Type':'audio/webm ; codecs=opus','Idempotency-Key':intent};
+  assert.equal((await f.request('/api/session',{cookie:f.owner.cookie})).data.features.voice,true);
+  const first=await f.send({headers});assert.equal(first.status,201,first.text);
+  const again=await f.send({headers});assert.deepEqual(again.data,first.data);assert.equal(f.calls(),1);
+  assert.equal((await f.send({headers,rawBody:Buffer.from('different source')})).status,409);assert.equal(f.calls(),1);
+  const id=first.data.message.id;assert.equal(first.data.message.voice.id,id);assert.ok(!first.text.includes('OggS'));
+  const audio=await f.request(`/api/voice/${id}`,{cookie:f.guest.cookie});
+  assert.equal(audio.status,200);assert.deepEqual(audio.bytes,normalizedVoice().bytes);
+  assert.equal(audio.headers['content-type'],'audio/ogg; codecs=opus');assert.equal(audio.headers['cache-control'],'no-store');
+  assert.equal(audio.headers['cross-origin-resource-policy'],'same-origin');assert.equal(audio.headers['x-content-type-options'],'nosniff');
+  assert.equal((await f.request(`/api/voice/${id}`)).status,401);
+  assert.equal((await f.request(`/api/voice/${id}`,{cookie:f.other.cookie})).status,403);
+  assert.equal((await f.request(`/api/voice/${id}`,{cookie:f.guest.cookie,headers:{'Sec-Fetch-Site':'cross-site'}})).status,403);
+  assert.ok(!(await f.request('/api/state')).text.includes(id));
+});
+
+test('voice upload checks identity, origin, block, encoding and size before calling the worker',async t=>{
+  const f=await voiceFixture(t);
+  assert.equal((await f.send({cookie:undefined})).status,401);
+  assert.equal((await f.send({origin:false})).status,403);
+  assert.equal((await f.send({cookie:f.other.cookie})).status,403);
+  assert.equal((await f.send({headers:{'Content-Type':'text/plain','Idempotency-Key':key()}})).status,415);
+  assert.equal((await f.send({headers:{'Content-Type':'audio/webm','Content-Encoding':'gzip','Idempotency-Key':key()}})).status,415);
+  // The connection may close before a native client finishes writing its
+  // oversized body. Either the 413 or the write reset is a refusal, never a
+  // successful upload; the worker counter and next request verify this below.
+  try {assert.equal((await f.send({rawBody:Buffer.alloc(5*1024*1024+1)})).status,413);}
+  catch(error){assert.ok(['EPIPE','ECONNRESET'].includes(error.code),String(error));}
+  assert.equal((await f.send({rawBody:Buffer.alloc(0)})).status,400);
+  f.app.store.block(f.guest.data.user.id,f.chat.threadId);
+  assert.equal((await f.send()).status,403);assert.equal(f.calls(),0);
+});
+
+test('voice upload rechecks the cookie after conversion instead of storing under a revoked session',async t=>{
+  let release,entered;
+  const started=new Promise(resolve=>entered=resolve);
+  const f=await voiceFixture(t,{testVoiceProcessor:()=>{entered();return new Promise(resolve=>release=()=>resolve(normalizedVoice()));}});
+  const pending=f.send();await started;
+  try {assert.equal((await f.request('/api/auth/logout',{method:'POST',cookie:f.owner.cookie,body:{}})).status,200);}
+  finally {release();}
+  assert.equal((await pending).status,401);
+  assert.equal(f.app.store.readThread(f.guest.data.user.id,f.chat.threadId).thread.messages.length,1);
+});
+
+test('voice conversion cannot cross a block, expiry or target removal that happened while waiting',async t=>{
+  for(const action of ['block','expiry','remove']) {
+    let release,entered;const started=new Promise(resolve=>entered=resolve);
+    const f=await voiceFixture(t,{testVoiceProcessor:()=>{entered();return new Promise(resolve=>release=()=>resolve(normalizedVoice()));}});
+    const pending=f.send();await started;
+    try {
+      if(action==='block')f.app.store.block(f.guest.data.user.id,f.chat.threadId);
+      else if(action==='expiry')f.advance(8*24*60*60_000);
+      else f.app.store.remove(f.owner.data.user.id,f.post.id);
+    } finally {release();}
+    assert.equal((await pending).status,action==='block'?403:404);
+    assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_messages WHERE text=\'\'').get().n,0);
+  }
+});
+
+test('voice admits only one upload and releases the slot after a failed worker',async t=>{
+  let release,entered,calls=0;const started=new Promise(resolve=>entered=resolve);
+  const f=await voiceFixture(t,{testVoiceProcessor:async()=>{if(++calls===1){entered();await new Promise(resolve=>release=resolve);throw new Error('private worker diagnostics');}return normalizedVoice();}});
+  const pending=f.send();await started;
+  try {assert.equal((await f.send()).status,429);assert.equal(calls,1);}finally{release();}
+  const failed=await pending;assert.equal(failed.status,500);assert.equal(failed.data.error,'internal_error');assert.ok(!failed.text.includes('diagnostics'));
+  assert.equal((await f.send()).status,201);assert.equal(calls,2);
+});
+
+test('report voice playback stays moderator-only after removal and vanishes on account erasure',async t=>{
+  const f=await voiceFixture(t),sent=await f.send();assert.equal(sent.status,201);
+  const id=sent.data.message.id;f.app.store.moderators.add(f.owner.data.user.id);
+  const report=f.app.store.report(f.guest.data.user.id,{targetType:'thread',targetId:f.chat.threadId,reason:'unsafe'},key());
+  f.app.store.resolveReport(f.owner.data.user.id,report.id,'remove');
+  const route=`/api/moderation/reports/${report.id}/voice/${id}`;
+  assert.equal((await f.request(`/api/voice/${id}`,{cookie:f.guest.cookie})).status,404);
+  assert.equal((await f.request(route,{cookie:f.guest.cookie})).status,403);
+  const proof=await f.request(route,{cookie:f.owner.cookie});assert.equal(proof.status,200);assert.deepEqual(proof.bytes,normalizedVoice().bytes);
+  assert.equal((await f.request('/api/account',{method:'DELETE',cookie:f.guest.cookie,body:{password:PASSWORD}})).status,204);
+  assert.equal((await f.request(route,{cookie:f.owner.cookie})).status,404);
 });

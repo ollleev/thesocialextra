@@ -39,3 +39,15 @@ L’application utilise des tuiles OpenStreetMap chargées par le navigateur ; r
 ## Mise à niveau des signalements
 
 La table d’attribution conserve les identifiants internes des personnes concernées jusqu’à la suppression du signalement, afin que l’effacement d’un compte fonctionne aussi après retrait ou expiration du contenu. Une ancienne base est renseignée automatiquement si les cibles existent encore. Si une preuve ancienne n’a plus de cible attribuable, le démarrage échoue avec `legacy_report_attribution_required` : conserver la sauvegarde et résoudre cette migration avec l’opérateur, sans deviner une identité ni effacer la preuve silencieusement. Tester la migration sur une copie avant de basculer une instance existante.
+
+## Vocaux facultatifs
+
+Les routes d’envoi ne sont activées que si l’opérateur définit `VOICE_SOCKET` sur un chemin Unix absolu maîtrisé. Le serveur web ne lance aucun décodeur : il contacte `voice-worker.mjs` par ce socket privé. Le worker ne doit jamais être routé vers Internet. Il ne possède pas d’authentification applicative ; les permissions Unix et le confinement constituent sa frontière de sécurité.
+
+Le modèle `deploy/thesocialextra-voice.service` attend un utilisateur système distinct, `thesocialextra-voice`, dans le groupe du service web `thesocialextra`. Son répertoire de socket est en 0750 et son socket en 0660. Il masque les répertoires de données et de secrets de l’application, utilise un espace réseau privé, n’autorise que les sockets Unix et limite la mémoire à 256 Mio. Vérifier les propriétés réellement appliquées, la lecture refusée des fichiers sensibles et un aller-retour synthétique avant toute activation. Adapter les chemins sans élargir les droits. FFmpeg et ffprobe doivent provenir d’une distribution maîtrisée et rester corrigés.
+
+Entrées : WebM, Ogg ou MP4, 5 Mio maximum. Sortie : Opus mono, 512 Kio maximum et 60 secondes de son réellement décodé. Le client s’arrête avant cette limite pour garder une marge ; le serveur refuse une durée excessive au lieu d’accepter une troncature. Les métadonnées d’origine sont retirées. Un seul traitement est admis à la fois, sans file d’attente ; une saturation laisse le texte disponible.
+
+Quotas du pilote : 20 vocaux par discussion, 20 Mio par expéditeur, 200 Mio de vocaux actifs au total et 50 Mio de copies vocales dans les signalements. Ces plafonds ne constituent pas une mesure de charge. Les copies des preuves suivent la conservation de 30 jours et l’effacement du compte concerné ; elles peuvent survivre à un retrait par modération. Une capacité insuffisante refuse le nouveau signalement sans supprimer les preuves antérieures. Prévoir un canal de recours humain distinct.
+
+Le micro n’est demandé qu’après un clic. Aucun enregistrement n’est envoyé automatiquement ; il peut être réécouté et effacé. Le texte reste disponible si le navigateur ne permet pas l’enregistrement ou la lecture. Les navigateurs et appareils ciblés doivent être testés réellement avant diffusion.

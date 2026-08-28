@@ -5,6 +5,8 @@ import { pointForLocation, distanceKm } from './locations.mjs';
 export const PRIVATE_RETENTION_MS = 7 * 24 * 60 * 60_000;
 export const REPORT_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const MAX_REPORT_MESSAGES = 20;
+const VOICE_CONTENT_TYPE = 'audio/ogg; codecs=opus';
+const MAX_VOICE_BYTES = 512 * 1024;
 const fail = (status, code) => { throw new ApiError(status, code); };
 const parse = row => row ? JSON.parse(row.data) : null;
 const canonical = value => JSON.stringify(value && typeof value === 'object'
@@ -16,14 +18,16 @@ const canonical = value => JSON.stringify(value && typeof value === 'object'
 export class ProductionStore {
   constructor({ db, clock = Date.now, moderators = [], maxPosts = 10000, maxMessages = 200, maxIntents = 2000,
     maxThreads = 10000, maxTotalMessages = 200000, maxTotalIntents = 250000, maxThreadsPerUser = 500,
-    maxReports = 5000, maxReportEvidenceBytes = 16 * 1024 } = {}) {
+    maxReports = 5000, maxReportEvidenceBytes = 16 * 1024, maxVoicesPerThread = 20,
+    maxVoiceBytesPerUser = 20 * 1024 * 1024, maxTotalVoiceBytes = 200 * 1024 * 1024,
+    maxReportVoiceBytes = 50 * 1024 * 1024 } = {}) {
     // Pilot safety limits, not measured commercial capacity. All instances using
     // one database must be configured with the same limits.
     // Reports consume at most ~78 MiB of new evidence at these defaults, plus
     // row/index overhead. This is a pilot budget, not a measured service capacity.
     // Existing evidence is never shortened or evicted to satisfy a lower limit.
     const limits = { maxPosts, maxMessages, maxIntents, maxThreads, maxTotalMessages, maxTotalIntents, maxThreadsPerUser,
-      maxReports, maxReportEvidenceBytes };
+      maxReports, maxReportEvidenceBytes, maxVoicesPerThread, maxVoiceBytesPerUser, maxTotalVoiceBytes, maxReportVoiceBytes };
     for (const [name, value] of Object.entries(limits)) {
       if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer`);
     }
@@ -45,6 +49,10 @@ export class ProductionStore {
         thread_id TEXT NOT NULL REFERENCES app_threads(id) ON DELETE CASCADE, sender TEXT NOT NULL CHECK(sender IN ('owner','guest')),
         text TEXT NOT NULL, created_at INTEGER NOT NULL) STRICT;
       CREATE INDEX IF NOT EXISTS app_messages_thread ON app_messages(thread_id,seq);
+      CREATE TABLE IF NOT EXISTS app_voices (message_id TEXT PRIMARY KEY REFERENCES app_messages(id) ON DELETE CASCADE,
+        sender_id TEXT NOT NULL, duration_ms INTEGER NOT NULL CHECK(duration_ms BETWEEN 1 AND 60000),
+        bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 27 AND 524288)) STRICT;
+      CREATE INDEX IF NOT EXISTS app_voices_sender ON app_voices(sender_id);
       CREATE TABLE IF NOT EXISTS app_intents (actor_id TEXT NOT NULL, scope TEXT NOT NULL, key TEXT NOT NULL,
         fingerprint TEXT NOT NULL, response TEXT NOT NULL, expires_at INTEGER NOT NULL,
         reference_type TEXT, reference_id TEXT, revoked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(actor_id,scope,key)) STRICT;
@@ -59,6 +67,9 @@ export class ProductionStore {
       CREATE TABLE IF NOT EXISTS app_report_subjects (report_id TEXT NOT NULL REFERENCES app_reports(id) ON DELETE CASCADE,
         user_id TEXT NOT NULL, PRIMARY KEY(report_id,user_id)) STRICT;
       CREATE INDEX IF NOT EXISTS app_report_subjects_user ON app_report_subjects(user_id,report_id);
+      CREATE TABLE IF NOT EXISTS app_report_voices (report_id TEXT NOT NULL REFERENCES app_reports(id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL, duration_ms INTEGER NOT NULL CHECK(duration_ms BETWEEN 1 AND 60000),
+        bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 27 AND 524288), PRIMARY KEY(report_id,message_id)) STRICT;
       CREATE TABLE IF NOT EXISTS app_suspended_users (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;
     `);
     // Attribution must survive moderation or normal expiry of the target. An
@@ -106,7 +117,7 @@ export class ProductionStore {
   actor(userId) { if (typeof userId !== 'string' || !userId) fail(401, 'login_required'); }
   writer(userId) { this.actor(userId); if (this.db.prepare('SELECT id FROM app_suspended_users WHERE id=?').get(userId)) fail(403, 'account_suspended'); }
   blocked(a, b) { return Boolean(this.db.prepare('SELECT 1 FROM app_blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)').get(a,b,b,a)); }
-  intent(userId, scope, key, payload, operation, retention = {}) {
+  cachedIntent(userId, scope, key, payload) {
     validateIdempotencyKey(key);
     const fingerprint = createHash('sha256').update(canonical(payload)).digest('hex');
     const previous = this.db.prepare('SELECT fingerprint,response,revoked FROM app_intents WHERE actor_id=? AND scope=? AND key=? AND expires_at>?').get(userId,scope,key,this.clock());
@@ -115,11 +126,20 @@ export class ProductionStore {
       if (previous.fingerprint !== fingerprint) fail(409,'idempotency_conflict');
       return JSON.parse(previous.response);
     }
+    return null;
+  }
+  checkIntentCapacity(userId) {
     // Never evict an unexpired key: doing so could turn a retry into a duplicate.
     this.db.prepare('DELETE FROM app_intents WHERE expires_at<=?').run(this.clock());
     if (this.db.prepare('SELECT COUNT(*) AS n FROM app_intents').get().n >= this.maxTotalIntents) fail(429,'total_idempotency_capacity_reached');
     const count = this.db.prepare('SELECT COUNT(*) AS n FROM app_intents WHERE actor_id=? AND expires_at>?').get(userId,this.clock()).n;
     if (count >= this.maxIntents) fail(429,'idempotency_capacity_reached');
+  }
+  intent(userId, scope, key, payload, operation, retention = {}) {
+    const previous = this.cachedIntent(userId,scope,key,payload);
+    if (previous !== null) return previous;
+    this.checkIntentCapacity(userId);
+    const fingerprint = createHash('sha256').update(canonical(payload)).digest('hex');
     const response = operation();
     const metadata = typeof retention === 'function' ? retention(response) : retention;
     this.db.prepare('INSERT INTO app_intents(actor_id,scope,key,fingerprint,response,expires_at,reference_type,reference_id) VALUES(?,?,?,?,?,?,?,?)')
@@ -216,7 +236,15 @@ export class ProductionStore {
     if(row.owner_id!==userId && row.guest_id!==userId) fail(403,'thread_access_denied');
     return {...row,side:row.owner_id===userId?'owner':'guest'};
   }
-  messages(id) { return this.db.prepare('SELECT id,sender,text,created_at AS createdAt FROM app_messages WHERE thread_id=? ORDER BY seq').all(id); }
+  messages(id) {
+    return this.db.prepare(`SELECT m.id,m.sender,m.text,m.created_at AS createdAt,
+      v.duration_ms AS voiceDuration,length(v.bytes) AS voiceBytes
+      FROM app_messages m LEFT JOIN app_voices v ON v.message_id=m.id WHERE m.thread_id=? ORDER BY m.seq`).all(id).map(message=>{
+      if(message.voiceDuration!==null) message.voice={id:message.id,durationMs:message.voiceDuration,bytes:message.voiceBytes,contentType:VOICE_CONTENT_TYPE};
+      delete message.voiceDuration; delete message.voiceBytes;
+      return message;
+    });
+  }
   readThread(userId,id) {
     const row=this.threadAccess(userId,id),messages=this.messages(id);
     return {thread:{id,postId:row.post_id,side:row.side,createdAt:row.created_at,updatedAt:row.updated_at,expiresAt:row.expires_at,
@@ -236,6 +264,77 @@ export class ProductionStore {
         return {message:msg};
       }, {type:'thread',id,expiresAt:row.expires_at});
     });
+  }
+  voiceSource(input, withBytes=false) {
+    // The HTTP boundary computes this digest from the original upload. Never
+    // trust a client-supplied digest, and accept bytes only from the normalizer.
+    fields(input,withBytes?['sourceHash','contentType','bytes','durationMs']:['sourceHash','contentType']);
+    if(typeof input.sourceHash!=='string' || input.sourceHash.length!==64 || !/^[a-f0-9]{64}$/.test(input.sourceHash) ||
+      !['audio/webm','audio/ogg','audio/mp4'].includes(input.contentType)) fail(400,'invalid_voice_source');
+    return {sourceHash:input.sourceHash,contentType:input.contentType};
+  }
+  voiceWriter(userId,id) {
+    this.writer(userId);
+    const thread=this.threadAccess(userId,id);
+    if(this.blocked(thread.owner_id,thread.guest_id)) fail(403,'contact_blocked');
+    return thread;
+  }
+  storedVoiceResult(userId,id,result) {
+    if(!this.db.prepare(`SELECT 1 FROM app_voices v JOIN app_messages m ON m.id=v.message_id
+      WHERE v.message_id=? AND v.sender_id=? AND m.thread_id=?`).get(result.message.id,userId,id)) fail(410,'intent_unavailable');
+    return result;
+  }
+  checkVoiceCapacity(userId,id,additionalBytes=1) {
+    if(this.db.prepare('SELECT COUNT(*) n FROM app_messages WHERE thread_id=?').get(id).n>=this.maxMessages) fail(429,'message_capacity_reached');
+    if(this.db.prepare('SELECT COUNT(*) n FROM app_messages').get().n>=this.maxTotalMessages) fail(429,'total_message_capacity_reached');
+    if(this.db.prepare('SELECT COUNT(*) n FROM app_voices v JOIN app_messages m ON m.id=v.message_id WHERE m.thread_id=?').get(id).n>=this.maxVoicesPerThread) fail(429,'voice_thread_capacity_reached');
+    if(this.db.prepare('SELECT COALESCE(SUM(length(bytes)),0) n FROM app_voices WHERE sender_id=?').get(userId).n+additionalBytes>this.maxVoiceBytesPerUser) fail(429,'voice_user_capacity_reached');
+    if(this.db.prepare('SELECT COALESCE(SUM(length(bytes)),0) n FROM app_voices').get().n+additionalBytes>this.maxTotalVoiceBytes) fail(429,'voice_total_capacity_reached');
+  }
+  prepareVoice(userId,id,input,key) {
+    this.writer(userId); const source=this.voiceSource(input); this.sweep();
+    return this.transaction(()=>{
+      this.voiceWriter(userId,id);
+      const replay=this.cachedIntent(userId,`message:${id}`,key,source);
+      if(replay!==null) return this.storedVoiceResult(userId,id,replay);
+      this.checkIntentCapacity(userId); this.checkVoiceCapacity(userId,id);
+      return null; // No reservation: final insertion rechecks access, expiry and all quotas.
+    });
+  }
+  addVoiceMessage(userId,id,input,key) {
+    this.writer(userId); const source=this.voiceSource(input,true); this.sweep();
+    return this.transaction(()=>{
+      const thread=this.voiceWriter(userId,id);
+      const result=this.intent(userId,`message:${id}`,key,source,()=>{
+        if(!Buffer.isBuffer(input.bytes) || input.bytes.length<27 || input.bytes.toString('ascii',0,4)!=='OggS' || input.bytes[4]!==0 ||
+          !Number.isSafeInteger(input.durationMs) || input.durationMs<1 || input.durationMs>60000) fail(400,'invalid_voice');
+        if(input.bytes.length>MAX_VOICE_BYTES) fail(413,'voice_too_large');
+        this.checkVoiceCapacity(userId,id,input.bytes.length);
+        const message={id:randomUUID(),sender:thread.side,text:'',createdAt:this.clock()};
+        message.voice={id:message.id,durationMs:input.durationMs,bytes:input.bytes.length,contentType:VOICE_CONTENT_TYPE};
+        this.db.prepare('INSERT INTO app_messages(id,thread_id,sender,text,created_at) VALUES(?,?,?,?,?)').run(message.id,id,message.sender,'',message.createdAt);
+        this.db.prepare('INSERT INTO app_voices(message_id,sender_id,duration_ms,bytes) VALUES(?,?,?,?)').run(message.id,userId,input.durationMs,input.bytes);
+        this.db.prepare('UPDATE app_threads SET updated_at=? WHERE id=?').run(message.createdAt,id);
+        return {message};
+      },{type:'thread',id,expiresAt:thread.expires_at});
+      return this.storedVoiceResult(userId,id,result);
+    });
+  }
+  getVoice(userId,messageId) {
+    this.actor(userId);
+    const message=this.db.prepare(`SELECT m.thread_id FROM app_voices v JOIN app_messages m ON m.id=v.message_id
+      JOIN app_threads t ON t.id=m.thread_id WHERE v.message_id=? AND t.expires_at>?`).get(messageId,this.clock());
+    if(!message) fail(404,'voice_not_found');
+    this.threadAccess(userId,message.thread_id);
+    const row=this.db.prepare('SELECT bytes,duration_ms FROM app_voices WHERE message_id=?').get(messageId);
+    return {bytes:Buffer.from(row.bytes),contentType:VOICE_CONTENT_TYPE,durationMs:row.duration_ms};
+  }
+  getReportVoice(userId,reportId,messageId) {
+    if(!this.moderators.has(userId)) fail(403,'moderator_required');
+    const row=this.db.prepare(`SELECT v.bytes,v.duration_ms FROM app_report_voices v JOIN app_reports r ON r.id=v.report_id
+      WHERE v.report_id=? AND v.message_id=? AND r.created_at>?`).get(reportId,messageId,this.clock()-REPORT_RETENTION_MS);
+    if(!row) fail(404,'voice_not_found');
+    return {bytes:Buffer.from(row.bytes),contentType:VOICE_CONTENT_TYPE,durationMs:row.duration_ms};
   }
   updates(userId, { cursor } = {}) {
     this.actor(userId); this.sweep();
@@ -295,11 +394,24 @@ export class ProductionStore {
       if(this.db.prepare('SELECT COUNT(*) AS n FROM app_reports').get().n>=this.maxReports) fail(429,'total_report_capacity_reached');
       if(this.db.prepare("SELECT COUNT(*) AS n FROM app_reports WHERE reporter_id=? AND created_at>?").get(userId,this.clock()-24*60*60_000).n>=10) fail(429,'report_capacity_reached');
       const evidence=this.reportEvidence(userId,input.targetType,targetId);
+      // Copy only voices actually retained by the bounded text/metadata excerpt.
+      // Keep blobs separate: neither evidence JSON nor intents contain audio bytes.
+      const voices=input.targetType==='thread'?JSON.parse(evidence).thread.messages.filter(message=>message.voice).map(message=>message.voice.id):[];
+      let incomingVoiceBytes=0;
+      for(const messageId of voices) {
+        const voice=this.db.prepare(`SELECT length(v.bytes) n FROM app_voices v JOIN app_messages m ON m.id=v.message_id
+          WHERE v.message_id=? AND m.thread_id=?`).get(messageId,targetId);
+        if(!voice) fail(500,'report_voice_unavailable');
+        incomingVoiceBytes+=voice.n;
+      }
+      if(incomingVoiceBytes>0 && this.db.prepare('SELECT COALESCE(SUM(length(bytes)),0) n FROM app_report_voices').get().n+incomingVoiceBytes>this.maxReportVoiceBytes) fail(429,'report_voice_capacity_reached');
       const id=randomUUID();
       this.db.prepare('INSERT INTO app_reports(id,reporter_id,target_type,target_id,reason,details,evidence,created_at) VALUES(?,?,?,?,?,?,?,?)').run(id,userId,input.targetType,targetId,input.reason,details,evidence,this.clock());
       const target=input.targetType==='post'?this.postRow(targetId):this.threadAccess(userId,targetId);
       const subjects=new Set(input.targetType==='post'?[target.owner_id]:[target.owner_id,target.guest_id]);
       for(const subject of subjects) this.db.prepare('INSERT INTO app_report_subjects(report_id,user_id) VALUES(?,?)').run(id,subject);
+      for(const messageId of voices) this.db.prepare(`INSERT INTO app_report_voices(report_id,message_id,duration_ms,bytes)
+        SELECT ?,message_id,duration_ms,bytes FROM app_voices WHERE message_id=?`).run(id,messageId);
       return {id,status:'open'};
     }));
   }

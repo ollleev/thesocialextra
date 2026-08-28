@@ -19,4 +19,5 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - run: node --test tests/*.test.mjs
+      - run: ffmpeg -version && ffprobe -version
+      - run: node --test --test-concurrency=2 tests/*.test.mjs

@@ -4,6 +4,7 @@ import { mergeSummary, markRead, unreadCount, freshPost, suggestedDraft } from '
 import { MessageOutbox, requestJSON as api } from './requests.js';
 import { createAccountUI } from './accounts.js';
 import { makeFeedShare, parseFeedLink } from './sharing.js';
+import { VoiceComposer, uploadVoice } from './voice.js';
 
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -29,6 +30,7 @@ state.point = null;
 const mutationKeys = new Map();
 const mutationsInFlight = new Set();
 const outbox = new MessageOutbox();
+const voice = new VoiceComposer({ onChange: renderVoice });
 const writeIntents = new Map();
 function writeKey(scope,payload) {
   const text=JSON.stringify(payload),previous=writeIntents.get(scope);
@@ -39,13 +41,14 @@ let accountGeneration=0,privateRevision=0,feedGeneration=0,events=null,liveReady
 const accounts = createAccountUI({openDialog,onError:errorText,onChange:async session=>{
   const changed=state.user?.id!==session.user?.id || state.production!==(session.mode==='production');
   const hadUser=Boolean(state.user);
-  state.production=session.mode==='production';state.user=session.user;state.moderator=session.moderator;
+  state.production=session.mode==='production';state.user=session.user;state.moderator=session.moderator;state.voiceEnabled=Boolean(session.features?.voice);
   $('#account-button').hidden=!state.production;
   $('#account-button').textContent=state.user?'Mon compte':'Connexion';
   $('#moderation-button').hidden=!session.moderator;
   if(state.production) {
     if(changed) {
       accountGeneration++; for(const id of Object.keys(threads)) delete threads[id];
+      voice.discard();stopAudio($('#chat'),true);stopAudio($('#moderation'),true);
       outbox.retain(new Set());writeIntents.clear();mutationKeys.clear();state.chat=null;
       state.mine=false;state.posts=[];state.readMarkers=state.user?readSession(`thesocialextra-read:${state.user.id}`):{};
       $('#chat').close();$('#inbox').close();
@@ -61,6 +64,7 @@ const accounts = createAccountUI({openDialog,onError:errorText,onChange:async se
     $('#post-form .fine-print').textContent='Gratuit · Conditions et paiement à convenir entre vous. L’annonce quitte le fil à expiration.';
     $('#help .help-copy').innerHTML='<p><strong>Vous êtes dispo ?</strong><br>Choisissez votre métier, une ville et une durée. Votre point apparaît en vert.</p><p><strong>Il manque quelqu’un ?</strong><br>Publiez votre besoin. Parlez-vous, puis confirmez chaque place vous-même. Un message ne réserve rien.</p><p><strong>Le fil reste frais.</strong><br>Les annonces pourvues quittent le fil public. Vous pouvez rouvrir une place jusqu’à l’expiration initiale. Les conversations privées restent disponibles sept jours après cette expiration, sauf suppression ou modération.</p><p><strong>Vous gardez la main.</strong><br>La localisation est approximative, à votre demande. Signalez un contenu ou bloquez un interlocuteur depuis l’échange. Les réponses sont actualisées quand l’application est visible ; pas de notification quand elle est fermée.</p><p><strong>Gratuit des deux côtés.</strong><br>Ni paiement ni contrat ne sont gérés ici. Les identités, compétences et autorisations de travail ne sont pas vérifiées. Convenez des conditions et effectuez les vérifications nécessaires avant toute mission.</p><p><a href="/privacy.html">Confidentialité et règles d’utilisation</a></p>';
   }
+  renderVoice();
   if(liveReady) { void changeFeed();void pollUpdates(); }
 }});
 $('#account-button').addEventListener('click',()=>accounts.show());
@@ -70,6 +74,9 @@ let toastTimer, chatTimer;
 let updatesRequest, updatesCursor = 0, updatesError = false, updatesCheckedAt = 0;
 function toast(message) { clearTimeout(toastTimer); $('#toast').textContent = message; $('#toast').hidden = false; toastTimer = setTimeout(() => $('#toast').hidden = true, 4500); }
 function errorText(error) {
+
+  const voiceErrors={microphone_denied:'Le micro n’a pas été autorisé. Vous pouvez toujours écrire.',recording_unavailable:'Le micro est indisponible. Vérifiez les permissions ou écrivez votre message.',recording_failed:'L’enregistrement a été interrompu. Réessayez ou utilisez le texte.',recording_empty:'Aucun son enregistré. Réessayez ou utilisez le texte.',recording_interrupted:'Enregistrement effacé lorsque l’application a été masquée.',audio_busy:'Un vocal est en cours de traitement. Attendez un instant puis réessayez.',audio_too_large:'Ce vocal est trop volumineux. Enregistrez un message plus court.',audio_too_long:'Le vocal dépasse une minute. Enregistrez un message plus court.',invalid_audio:'Ce vocal ne peut pas être lu. Effacez-le puis réessayez.',unsupported_audio_type:'Ce format audio n’est pas accepté. Utilisez un autre navigateur ou le texte.',audio_processing_unavailable:'Le service vocal est indisponible. Votre enregistrement reste ici ; vous pouvez aussi écrire.',audio_processing_timeout:'Le traitement a pris trop de temps. Réessayez le même enregistrement.',voice_thread_capacity_reached:'La limite de 20 vocaux de cet échange est atteinte. Le texte reste disponible.',voice_user_capacity_reached:'Votre espace vocal est plein. Le texte reste disponible.',voice_total_capacity_reached:'Le service vocal a atteint sa capacité. Le texte reste disponible.',report_voice_capacity_reached:'Le stockage des preuves vocales est plein. Aucun signalement enregistré ; bloquez l’interlocuteur si nécessaire et réessayez plus tard.'};
+  if(voiceErrors[error.code])return voiceErrors[error.code];
   if (error.code === 'request_timeout') return 'Le serveur ne répond pas. Résultat non confirmé ; votre saisie est conservée.';
   if (error.code === 'no_place_to_reopen') return 'Toutes les places sont déjà ouvertes.';
   if (error.code === 'idempotency_capacity_reached') return 'La limite de changements de cet essai est atteinte.';
@@ -133,6 +140,7 @@ function receive(data) {
   if(!state.production) for (const id of Object.keys(owners)) if (!state.posts.some(p => p.id === id)) delete owners[id];
   for (const key of mutationKeys.keys()) if (!state.posts.some(p => key.startsWith(`${p.id}:`))) mutationKeys.delete(key);
   for (const id of Object.keys(threads)) if (threads[id].expiresAt < now()) delete threads[id];
+  invalidateUnavailableChat();
   outbox.retain(new Set(Object.keys(threads)));
   saveSession(); render(); renderUpdates(); if ($('#inbox').open) renderInbox();
 }
@@ -140,7 +148,7 @@ function openDialog(dialog) { $$('dialog[open]').forEach(d => d.close()); dialog
 $$('.close-dialog').forEach(button => button.addEventListener('click', () => button.closest('dialog').close()));
 $$('dialog').forEach(dialog => {
   dialog.addEventListener('click', e => { if (e.target === dialog) { const r = dialog.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right) dialog.close(); } });
-  dialog.addEventListener('close', () => { if (dialog.id === 'chat' && !dialog.open) { clearInterval(chatTimer); state.chat = null; } });
+  dialog.addEventListener('close', () => { if (dialog.id === 'chat' && !dialog.open) { clearInterval(chatTimer); state.chat = null; voice.discard();stopAudio(dialog); } if(dialog.id==='moderation')stopAudio(dialog); });
 });
 function openComposer(kind) {
   if(!accounts.require(()=>openComposer(kind))) return;
@@ -376,7 +384,8 @@ async function refreshModeration() {
   try {
     const data=await api('/api/moderation/reports'),reports=Array.isArray(data)?data:data.reports;
     if(generation!==accountGeneration||!state.moderator||!$('#moderation').open)return;
-    $('#moderation-list').innerHTML=reports.length?reports.map(report=>`<article class="moderation-report"><h3>${esc(report.reason)}</h3><p>${esc(report.details)}</p><details><summary>Voir le contenu signalé</summary><pre>${esc(report.evidence)}</pre></details><div class="safety-actions"><button class="button danger" data-resolve-report="${esc(report.id)}" data-action="remove">Retirer le contenu</button><button class="button outline" data-resolve-report="${esc(report.id)}" data-action="dismiss">Classer sans suite</button></div></article>`).join(''):'<p>Aucun signalement en attente.</p>';
+    stopAudio($('#moderation'),true);
+    $('#moderation-list').innerHTML=reports.length?reports.map(report=>`<article class="moderation-report"><h3>${esc(report.reason)}</h3><p>${esc(report.details)}</p><details><summary>Voir le contenu signalé</summary><pre>${esc(report.evidence)}</pre>${reportVoiceMarkup(report)}</details><div class="safety-actions"><button class="button danger" data-resolve-report="${esc(report.id)}" data-action="remove">Retirer le contenu</button><button class="button outline" data-resolve-report="${esc(report.id)}" data-action="dismiss">Classer sans suite</button></div></article>`).join(''):'<p>Aucun signalement en attente.</p>';
   }catch(error){if(generation===accountGeneration&&state.moderator){$('#moderation-error').textContent=errorText(error);$('#moderation-error').hidden=false;}}
 }
 $('#moderation-button').addEventListener('click',()=>{openDialog($('#moderation'));void refreshModeration();});
@@ -422,6 +431,7 @@ async function pollUpdates() {
         const active=new Set(summaries.map(t=>t.id));
         for(const id of Object.keys(threads)) if(!active.has(id)) delete threads[id];
         for(const summary of summaries) threads[summary.id]=mergeSummary(threads[summary.id]||readMarkers[summary.id],summary);
+        invalidateUnavailableChat();
         outbox.retain(active);updatesError=false;updatesCheckedAt=now();saveSession();
       } catch(error) {
         if(generation===accountGeneration) {updatesError=true;if(error.status===401) void accounts.refresh().catch(()=>{});}
@@ -453,6 +463,7 @@ async function pollUpdates() {
         } else if (item.kind === 'thread' && threads[item.id]?.token === sent?.token) delete threads[item.id];
       }
       for (const [id, thread] of Object.entries(threads)) if (thread.expiresAt <= now()) delete threads[id];
+      invalidateUnavailableChat();
       updatesError = false; updatesCheckedAt = now(); saveSession();
     } catch { updatesError = true; }
     finally { updatesRequest = null; renderUpdates(); if ($('#inbox').open) renderInbox(); }
@@ -466,6 +477,79 @@ $('#refresh-inbox').addEventListener('click', pollUpdates);
 $('#inbox-list').addEventListener('click', e => { const button = e.target.closest('[data-thread]'); if (button) openChat(button.dataset.thread); });
 let chatRequest = 0;
 const chatReads = new Map();
+function stopAudio(root,forget=false) {
+  root.querySelectorAll('audio').forEach(audio=>{audio.pause?.();if(forget){audio.removeAttribute('src');audio.load?.();}});
+}
+function invalidateUnavailableChat() {
+  if(!state.chat||threads[state.chat])return;
+  clearInterval(chatTimer);++chatRequest;state.chat=null;
+  voice.discard();stopAudio($('#chat'),true);$('#chat-messages').replaceChildren();
+  $('#chat-form').hidden=true;$('#chat-input').disabled=true;$('#chat-form button').disabled=true;
+  $('#chat-safety').hidden=true;$('#chat-block-status').textContent='';
+  $('#chat-error').textContent='Cette conversation n’est plus disponible.';$('#chat-error').hidden=false;
+}
+function reportVoiceMarkup(report) {
+  try {
+    const messages=JSON.parse(report.evidence).thread?.messages||[];
+    return messages.filter(message=>message.voice&&/^[a-zA-Z0-9-]{1,80}$/.test(message.id)).map(message=>`<p class="voice-message-label">Vocal signalé · ${Math.ceil(message.voice.durationMs/1000)} s</p><audio controls preload="none" aria-label="Écouter le vocal signalé" src="/api/moderation/reports/${encodeURIComponent(report.id)}/voice/${encodeURIComponent(message.id)}"></audio>`).join('');
+  }catch{return '';}
+}
+function renderVoice() {
+  const panel=$('#voice-composer'),snapshot=voice.snapshot(),blocked=Boolean(threads[state.chat]?.blocked);
+  panel.hidden=!state.production||!state.voiceEnabled||!state.chat||!threads[state.chat];
+  const playable=Boolean($('#voice-preview').canPlayType?.('audio/ogg; codecs=opus'));
+  $('#voice-record').hidden=snapshot.phase!=='idle'||!snapshot.supported||!playable;
+  $('#voice-record').disabled=blocked;
+  $('#voice-help').textContent=blocked?'Cet échange est bloqué.':!snapshot.supported||!playable?'Les vocaux ne sont pas disponibles dans ce navigateur. Le texte reste disponible.':'1 minute maximum. Vous écoutez, puis vous choisissez d’envoyer.';
+  $('#voice-active').hidden=snapshot.phase==='idle';
+  const labels={requesting:'Autorisez le micro pour enregistrer.',recording:`Enregistrement · 0:${String(snapshot.seconds).padStart(2,'0')} / 1:00`,finishing:'Préparation de votre écoute…',ready:'Votre vocal est prêt. Rien n’est encore envoyé.',sending:'Envoi et vérification du vocal…'};
+  $('#voice-status').textContent=snapshot.error&&snapshot.phase==='ready'?'Envoi non confirmé. Réessayez ce même vocal ou effacez le brouillon.':labels[snapshot.phase]||'';
+  $('#voice-stop').hidden=snapshot.phase!=='recording';
+  $('#voice-send').hidden=!['ready','sending'].includes(snapshot.phase);
+  $('#voice-send').disabled=snapshot.phase==='sending'||blocked;
+  $('#voice-send').textContent=snapshot.error?'Réessayer l’envoi':snapshot.phase==='sending'?'Envoi en cours…':'Envoyer le vocal';
+  $('#voice-discard').disabled=snapshot.phase==='sending';
+  const preview=$('#voice-preview');preview.hidden=!snapshot.previewUrl;
+  if(preview.getAttribute('src')!==snapshot.previewUrl){preview.pause?.();if(snapshot.previewUrl)preview.src=snapshot.previewUrl;else preview.removeAttribute('src');preview.load?.();}
+  $('#voice-error').hidden=!snapshot.error;if(snapshot.error)$('#voice-error').textContent=errorText(snapshot.error);
+}
+function renderChatMessages(thread,id) {
+  const container=$('#chat-messages'),existing=new Map([...container.children].map(node=>[node.dataset.messageId,node]));
+  const beforeBottom=$('#chat').scrollTop+$('#chat').clientHeight>=$('#chat').scrollHeight-120;
+  let changed=false;
+  thread.messages.forEach((message,index)=>{
+    const signature=JSON.stringify([message,thread.side,threads[id].timezone]);let node=existing.get(message.id);
+    if(!node||node.dataset.signature!==signature) {
+      if(node){stopAudio(node,true);node.remove();}
+      node=document.createElement('div');node.className=`chat-bubble ${message.sender===thread.side?'mine':''}`;node.dataset.messageId=message.id;node.dataset.signature=signature;
+      if(message.voice) {
+        const label=document.createElement('p');label.className='voice-message-label';label.textContent=`Message vocal · ${Math.ceil(message.voice.durationMs/1000)} s`;node.append(label);
+        const audio=document.createElement('audio');audio.controls=true;audio.preload='none';audio.src=`/api/voice/${encodeURIComponent(message.id)}`;audio.setAttribute('aria-label',`Écouter le vocal ${message.sender===thread.side?'envoyé':'reçu'}`);
+        const unavailable=document.createElement('p');unavailable.className='field-help';unavailable.hidden=true;unavailable.textContent='Lecture indisponible. Le vocal peut avoir expiré, ou ce navigateur ne lit pas ce format.';
+        audio.addEventListener('error',()=>{unavailable.hidden=false;});node.append(audio,unavailable);
+      }else node.append(document.createTextNode(message.text));
+      const meta=document.createElement('small');meta.textContent=`${message.sender===thread.side?'Vous':'Votre interlocuteur'} · ${time(message.createdAt,threads[id].timezone)}`;node.append(meta);
+      changed=true;
+    }
+    if(container.children[index]!==node)container.insertBefore(node,container.children[index]||null);
+    existing.delete(message.id);
+  });
+  for(const node of existing.values()){stopAudio(node,true);node.remove();changed=true;}
+  // Stable nodes keep their playback position when a new text reply arrives.
+  if(changed&&beforeBottom)$('#chat-form').scrollIntoView({block:'end'});
+}
+$('#voice-record').addEventListener('click',()=>{if(state.voiceEnabled&&state.chat&&threads[state.chat]&&!threads[state.chat].blocked)void voice.start();});
+$('#voice-stop').addEventListener('click',()=>voice.stop());
+$('#voice-discard').addEventListener('click',()=>voice.discard());
+$('#voice-send').addEventListener('click',async()=>{
+  const id=state.chat,generation=accountGeneration;if(!id||!threads[id]||threads[id].blocked||!state.voiceEnabled)return;
+  const intent=voice.beginSend();if(!intent)return;
+  try {await uploadVoice(id,intent);if(voice.finishSend(intent)&&state.chat===id&&generation===accountGeneration){toast('Vocal envoyé.');void refreshChat();}}
+  catch(error){voice.finishSend(intent,error);}
+});
+document.addEventListener('play',event=>{if(event.target.tagName==='AUDIO')$$('audio').forEach(audio=>{if(audio!==event.target)audio.pause?.();});},true);
+document.addEventListener('visibilitychange',()=>{if(document.hidden){stopAudio(document);if(['requesting','recording','finishing'].includes(voice.phase))voice.fail('recording_interrupted');}});
+window.addEventListener('pagehide',()=>{voice.discard();stopAudio(document,true);});
 function refreshChat() {
   const id = state.chat; if (!id || !threads[id] || document.hidden || !$('#chat').open) return;
   if (chatReads.has(id)) return chatReads.get(id);
@@ -474,10 +558,10 @@ function refreshChat() {
   try {
     const { thread } = await api(`/api/threads/${id}`, { chat: state.production?undefined:threads[id].token });
     if (state.chat !== id || request !== chatRequest || !threads[id] || !$('#chat').open || document.hidden) return;
-    const html = thread.messages.map(message => `<div class="chat-bubble ${message.sender === thread.side ? 'mine' : ''}">${esc(message.text)}<small>${message.sender === thread.side ? 'Vous' : 'Votre interlocuteur'} · ${time(message.createdAt, threads[id].timezone)}</small></div>`).join('');
-    if ($('#chat-messages').innerHTML !== html) { $('#chat-messages').innerHTML = html; $('#chat-form').scrollIntoView({ block: 'end' }); }
+    renderChatMessages(thread,id);
     threads[id] = markRead(threads[id], { incomingCount: thread.incomingCount, messageCount: thread.messages.length, updatedAt: thread.updatedAt });
     threads[id].blocked=thread.blocked;threads[id].blockedByMe=thread.blockedByMe;
+    if(thread.blocked&&voice.phase!=='idle')voice.discard();renderVoice();
     $('#chat-input').disabled=Boolean(thread.blocked);
     $('#chat-form button').disabled=Boolean(thread.blocked)||outbox.get(id).busy;
     if(state.production) {
@@ -492,7 +576,7 @@ function refreshChat() {
   } catch (error) {
     if (state.chat !== id || request !== chatRequest) return;
     $('#chat-error').textContent = errorText(error); $('#chat-error').hidden = false;
-    if (error.status === 404 || error.status === 403) { clearInterval(chatTimer); $('#chat-form').hidden = true; delete threads[id]; outbox.retain(new Set(Object.keys(threads))); saveSession(); renderUpdates(); }
+    if (error.status === 404 || error.status === 403) { delete threads[id];invalidateUnavailableChat(); outbox.retain(new Set(Object.keys(threads))); saveSession(); renderUpdates(); }
   } finally { chatReads.delete(id); }
   })();
   chatReads.set(id, pending);
@@ -501,6 +585,7 @@ function refreshChat() {
 async function openChat(id) {
   if (!threads[id]) return;
   clearInterval(chatTimer);
+  voice.discard();stopAudio($('#chat'),true);
   openDialog($('#chat')); state.chat = id; ++chatRequest;
   $('#chat-title').textContent = 'En direct, à deux.';
   $('#chat-subtitle').textContent = `${threads[id].role} · ${threads[id].zoneLabel} · ${state.production?`privé jusqu’au ${dateTime(threads[id].expiresAt,threads[id].timezone)}`:'échange local'}`;
@@ -511,6 +596,7 @@ async function openChat(id) {
   if (entry.error) $('#chat-error').textContent = errorText(entry.error);
   $('#chat-form').hidden = false; $('#chat-input').value = entry.draft;
   $('#chat-form button').disabled = entry.busy;
+  renderVoice();
   await refreshChat(); if (state.chat === id && $('#chat').open) chatTimer = setInterval(refreshChat, 1800);
 }
 $('#chat-input').addEventListener('input', () => { if (state.chat) outbox.edit(state.chat, $('#chat-input').value); });
