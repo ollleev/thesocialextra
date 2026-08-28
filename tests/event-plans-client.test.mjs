@@ -122,6 +122,7 @@ async function publishingFixture({ cityReady = Promise.resolve(), publishPost = 
     ...f, ui, content, dialog, openings: () => openings,
     submit: () => contentListeners.get('submit')({ target: { id: 'event-post-preview-form' }, preventDefault() {} }),
     retry: () => contentListeners.get('click')({ target: { closest: () => ({ dataset: { previewAction: 'retry' }, disabled: false }) } }),
+    newPreview: () => contentListeners.get('click')({ target: { closest: () => ({ dataset: { previewAction: 'new' }, disabled: false }) } }),
   };
 }
 
@@ -161,6 +162,48 @@ test('publication navigation hide and reopen preserve an uncertain attempt until
   assert.equal(f.calls.length, 2, 'retry does not derive or verify a replacement request');
   assert.equal(f.ui.pending(entry.id), false);
   assert.match(f.content.innerHTML, /Annonce publiée/);
+});
+
+test('expired publication is terminal but an explicit new preview uses the current event', async t => {
+  for (const finished of [false, true]) await t.test(finished ? 'finished event' : 'future event', async () => {
+    const sent = [], f = await publishingFixture({ publishPost: async args => {
+      sent.push(structuredClone(args));
+      if (sent.length === 1) throw problem('request_timeout');
+      if (sent.length === 2) throw problem('post_expired', 410);
+      return { post: { id: 'new-publication' } };
+    } });
+    const entry = f.client.current, needId = entry.saved.needs[0].id;
+    const before = structuredClone(entry.saved);
+    await f.ui.show(entry, needId); f.submit();
+    f.calls[1].resolve({ plan: structuredClone(entry.saved) });
+    await new Promise(resolve => setImmediate(resolve));
+    f.advance(finished ? 108000000 : 61 * 60_000);
+    f.retry(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent.length, 2); assert.deepEqual(sent[1], sent[0]);
+    assert.match(f.content.innerHTML, /Cette tentative est terminée/);
+    assert.doesNotMatch(f.content.innerHTML, /data-preview-action="retry"|type="submit"/);
+    f.retry(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent.length, 2, 'the expired attempt cannot be sent again');
+    assert.match(f.content.innerHTML, /data-preview-action="new">Préparer une autre annonce/);
+    f.newPreview();
+    assert.equal(sent.length, 2, 'new preview does not publish automatically');
+    assert.equal(f.calls.length, 2, 'new preview does not perform a publication preflight');
+    if (finished) {
+      assert.match(f.content.innerHTML, /L’événement est terminé/);
+      assert.match(f.content.innerHTML, /<button type="submit"[^>]*disabled/);
+      f.submit(); await new Promise(resolve => setImmediate(resolve));
+      assert.equal(sent.length, 2); assert.equal(f.calls.length, 2);
+    } else {
+      assert.match(f.content.innerHTML, /id="event-post-preview-form"/);
+      f.submit(); assert.equal(f.calls.length, 3);
+      f.calls[2].resolve({ plan: structuredClone(entry.saved) });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(sent.length, 3); assert.notEqual(sent[2].key, sent[0].key);
+      assert.equal(sent[2].draft.notAfter, entry.saved.endsAt);
+      assert.match(f.content.innerHTML, /Annonce publiée/);
+    }
+    assert.deepEqual(entry.saved, before, 'manual confirmations remain unchanged');
+  });
 });
 
 test('create retry preserves UUID and exact original payload despite subsequent edits', async () => {
@@ -386,12 +429,12 @@ const opts = (extra = {}) => ({ now: Date.UTC(2026, 7, 28), roles: ['driver'], .
   assert.equal(result.ok, true);
   assert.deepEqual(result.draft, {
     kind: 'need', role: 'driver', cityId: 'paris', english: true, vehicle: false,
-    durationMinutes: 60, places: 1,
+    durationMinutes: 60, notAfter: plan.endsAt, places: 1,
     note: 'Mission : 29/08/2026 09:00 → 30/08/2026 11:30 (Europe/Paris). Français souhaité. Anglais requis.'
   });
   assert.deepEqual(result.source, { planId: 'event-1', revision: 2, needId: 'need-1' });
   assert.equal(result.remaining, 1); assert.deepEqual(result.allowedDurations, [30, 60, 120, 240]);
-  assert.deepEqual(plan, before); assert.deepEqual(Object.keys(result.draft).sort(), ['cityId','durationMinutes','english','kind','note','places','role','vehicle']);
+  assert.deepEqual(plan, before); assert.deepEqual(Object.keys(result.draft).sort(), ['cityId','durationMinutes','english','kind','notAfter','note','places','role','vehicle']);
  });
 
 test('rejects full, invalid, duplicate, and unknown needs', () => {
@@ -538,6 +581,26 @@ test('event publication preflight reads current ownership/revision without chang
   f.calls[2].resolve({ plan: { ...before, revision: before.revision + 1 } });
   await assert.rejects(stale, { code: 'event_plan_changed' });
   assert.equal(f.client.current.saved.revision, before.revision); assert.equal(f.client.current.conflict, true);
+});
+
+test('event publication preflight rejects a missing or changed immutable deadline', async t => {
+  for (const scenario of ['missing', 'longer', 'shorter', 'string', 'server-changed']) await t.test(scenario, async () => {
+    const f = fixture(), saved = f.client.save();
+    f.calls[0].resolve({ plan: view(f.client.current) }); await saved;
+    const before = structuredClone(f.client.current.saved);
+    const prepared = f.client.preparePost(before.needs[0].id, { roles: ROLES });
+    const draft = { ...prepared.draft }, server = structuredClone(before);
+    if (scenario === 'missing') delete draft.notAfter;
+    if (scenario === 'longer') draft.notAfter += 60_000;
+    if (scenario === 'shorter') draft.notAfter -= 60_000;
+    if (scenario === 'string') draft.notAfter = String(draft.notAfter);
+    if (scenario === 'server-changed') server.endsAt += 60_000;
+    const pending = f.client.verifyPostSource(prepared.source, draft, ROLES);
+    f.calls[1].resolve({ plan: server });
+    await assert.rejects(pending, { code: 'event_draft_unavailable' });
+    assert.deepEqual(f.client.current.saved, before);
+    assert.equal(f.calls.length, 2);
+  });
 });
 
 test('preflight aborts when the account or draft changes during its read and rechecks remaining time', async () => {
@@ -912,7 +975,7 @@ test('renderer uncertain state shows retry button and no new-publish form', () =
   assert.equal(html.includes('<form'), false);
   assert.ok(html.includes('role="status"'));
   assert.ok(html.includes('exact intent'));
-  assert.ok(html.includes('Résumé : 2 places, visible pendant 60 minutes.'));
+  assert.ok(html.includes('Résumé : 2 places, visible jusqu’à 60 minutes, sans dépasser la fin de l’événement.'));
 });
 
 test('renderer success state shows view and new buttons, no form', () => {

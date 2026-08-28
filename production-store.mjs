@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { ApiError, ROLES, ZONES, validatePost, publicPost, fields, text, incomingMessages, validateIdempotencyKey } from './domain.mjs';
+import { resolvePostExpiry } from './post-expiry.mjs';
 import { pointForLocation, distanceKm } from './locations.mjs';
 
 export const PRIVATE_RETENTION_MS = 7 * 24 * 60 * 60_000;
@@ -241,9 +242,12 @@ export class ProductionStore {
       const result=this.intent(userId,'create',key,data,()=>{
       if (this.db.prepare('SELECT COUNT(*) AS n FROM app_posts').get().n>=this.maxPosts) fail(429,'post_capacity_reached');
       if (this.db.prepare('SELECT COUNT(*) AS n FROM app_posts WHERE owner_id=? AND expires_at>?').get(userId,this.clock()).n>=10) fail(429,'own_post_capacity_reached');
-      const now=this.clock(), id=randomUUID();
-      const post={...data,id,totalPlaces:data.places,createdAt:now,updatedAt:now,expiresAt:now+data.durationMinutes*60_000,status:'open',revision:0,demo:false};
+      const now=this.clock(), expiry=resolvePostExpiry(data.durationMinutes,data.notAfter,now);
+      if(!expiry.ok) fail(expiry.code==='post_deadline_elapsed'?410:400,expiry.code);
+      const id=randomUUID();
+      const post={...data,id,totalPlaces:data.places,createdAt:now,updatedAt:now,expiresAt:expiry.expiresAt,status:'open',revision:0,demo:false};
       delete post.durationMinutes;
+      delete post.notAfter;
       this.db.prepare('INSERT INTO app_posts(id,owner_id,data,lat,lng,expires_at,retain_until) VALUES(?,?,?,?,?,?,?)').run(id,userId,JSON.stringify(post),post.lat,post.lng,post.expiresAt,post.expiresAt+PRIVATE_RETENTION_MS);
       this.publicChanged=true;
       return {post:publicPost(post)};

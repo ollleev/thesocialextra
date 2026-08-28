@@ -117,7 +117,7 @@ export class EventPlansClient {
     }
     const checked = prepareEventPost(plan, source.needId, { roles, now: this.now(), places: draft.places, durationMinutes: draft.durationMinutes });
     if (!checked.ok) throw issue(checked.code);
-    if (checked.draft.role !== draft.role || checked.draft.cityId !== draft.cityId) throw issue('event_draft_unavailable');
+    if (checked.draft.role !== draft.role || checked.draft.cityId !== draft.cityId || checked.draft.notAfter !== draft.notAfter) throw issue('event_draft_unavailable');
     // Preflight only. This read is not a reservation or an atomic event/post link.
     return true;
   }

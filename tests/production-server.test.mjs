@@ -1,3 +1,6 @@
+import { prepareEventPost } from '../public/event-post-drafts.js';
+import { EventPostPreviewState, renderEventPostPreview } from '../public/event-post-preview.js';
+import { ROLES } from '../domain.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -875,4 +878,52 @@ test('event plan save rechecks rules after a partial request body',async t=>{
  await accepted;f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(owner.data.user.id);
  pending.end(payload.slice(1));assert.equal(await response,403);
  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_event_plans').get().n,0);
+});
+
+
+test('event publication retries honor the original deadline over real authenticated HTTP', async t => {
+  for(const scenario of ['never-sent','already-committed','delayed-before-deadline']) await t.test(scenario,async t=>{
+    let now=Date.UTC(2026,7,28);
+    const f=await fixture(t,{clock:()=>now}), account=await f.register('deadline_fixture');
+    const planResponse=await f.request('/api/event-plans',{method:'POST',cookie:account.cookie,body:eventPlanInput()});
+    assert.equal(planResponse.status,201);
+    const plan=planResponse.data.plan, originalEnd=plan.endsAt, calls=[];
+    let firstPost=null, keys=0;
+    const state=new EventPostPreviewState({role:'Serveur',cityLabel:'Paris',remaining:2,
+      derive:options=>prepareEventPost(plan,plan.needs[0].id,{...options,now,roles:ROLES}),
+      makeKey:()=>{keys++;return key();},
+      send:async args=>{
+        calls.push(structuredClone(args));
+        if(calls.length===1&&scenario!=='already-committed')throw Error('synthetic network interruption');
+        const response=await f.request('/api/posts',{method:'POST',cookie:account.cookie,body:args.draft,headers:{'Idempotency-Key':args.key}});
+        if(response.status>=400)throw Object.assign(Error(response.data.error),{status:response.status,code:response.data.error});
+        if(calls.length===1){firstPost=response.data.post;throw Error('synthetic lost success response');}
+        return response.data;
+      },
+    });
+    assert.equal(await state.publish(),false);assert.equal(state.snapshot().phase,'uncertain');
+    now=scenario==='delayed-before-deadline'?originalEnd-10*60_000:originalEnd;
+    plan.endsAt+=24*60*60_000;
+    const result=await state.publish();
+    assert.equal(calls.length,2);assert.equal(keys,1);
+    assert.equal(calls[1].key,calls[0].key);assert.deepEqual(calls[1].draft,calls[0].draft);
+    assert.equal(calls[1].draft.notAfter,originalEnd);
+    assert.equal(calls[1].retry,true);
+    assert.equal(await state.publish(),false);assert.equal(calls.length,2);
+    if(scenario==='delayed-before-deadline'){
+      assert.equal(result,true);assert.equal(state.snapshot().phase,'success');
+      const post=(await f.request('/api/posts/'+state.snapshot().postId)).data.post;
+      assert.equal(post.expiresAt,originalEnd);assert.equal(Object.hasOwn(post,'notAfter'),false);
+    }else{
+      assert.equal(result,false);assert.equal(state.snapshot().phase,'expired');
+      assert.equal(state.snapshot().errorCode,scenario==='never-sent'?'post_deadline_elapsed':'post_expired');
+      const html=renderEventPostPreview(state.snapshot());
+      assert.match(html,/Cette tentative est terminée/);assert.doesNotMatch(html,/data-preview-action="retry"|type="submit"/);
+      assert.equal(state.edit({places:1}),false);
+      const rows=f.db.prepare('SELECT id FROM app_posts').all();
+      assert.deepEqual(rows.map(row=>row.id),firstPost?[firstPost.id]:[]);
+      assert.equal((await f.request('/api/state')).data.posts.length,0);
+    }
+    assert.equal((await f.request('/api/event-plans/'+plan.id,{cookie:account.cookie})).data.plan.totals.confirmed,1);
+  });
 });

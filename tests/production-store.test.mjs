@@ -88,6 +88,42 @@ test('durable posts, messages and intents survive reopening; backup restores the
   } finally { restored.close(); }
 });
 
+test('absolute post deadlines survive retries, reopening, deletion and intent retention', t => {
+  const f=fixture(t), start=f.store.clock(), deadline=start+60*60_000;
+  const body=input({durationMinutes:120,notAfter:deadline}), intent=key('deadline');
+  const post=f.store.create('owner',body,intent).post;
+  assert.equal(post.expiresAt,deadline);
+  assert.equal(Object.hasOwn(post,'notAfter'),false);
+  f.advance(15*60_000); f.reopen();
+  assert.deepEqual(f.store.create('owner',body,intent).post,post);
+  assert.throws(()=>f.store.create('owner',{...body,notAfter:deadline+1},intent),error(409,'idempotency_conflict'));
+  assert.throws(()=>f.store.create('owner',input({durationMinutes:120}),intent),error(409,'idempotency_conflict'));
+  f.advance(45*60_000);
+  assert.throws(()=>f.store.create('owner',body,intent),error(410,'post_expired'));
+  assert.throws(()=>f.store.create('owner',body,key('never-recorded')),error(410,'post_deadline_elapsed'));
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_posts').get().n,1);
+  f.store.remove('owner',post.id);
+  assert.throws(()=>f.store.create('owner',body,intent),error(410,'intent_unavailable'));
+  f.advance(PRIVATE_RETENTION_MS+1); f.reopen();
+  assert.throws(()=>f.store.create('owner',body,intent),error(410,'post_deadline_elapsed'));
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_posts').get().n,0);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_intents').get().n,0);
+});
+
+test('deadline validation does not coerce data or shorten ordinary posts', t => {
+  const f=fixture(t), now=f.store.clock();
+  for(const value of [null,false,true,'1800003600000',{},[],NaN,Infinity,-1,1.5,253402300800000]){
+    assert.throws(()=>f.store.create('owner',input({notAfter:value}),key('invalid')),error(400,'invalid_post_deadline'));
+  }
+  for(const notAfter of [0,now-1,now]){
+    assert.throws(()=>f.store.create('owner',input({notAfter}),key('past')),error(410,'post_deadline_elapsed'));
+  }
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_intents').get().n,0);
+  const plain=f.store.create('owner',input(),key('plain')).post;
+  const bounded=f.store.create('owner',input({notAfter:now+120*60_000}),key('future')).post;
+  assert.equal(plain.expiresAt,now+30*60_000);assert.equal(bounded.expiresAt,plain.expiresAt);
+});
+
 test('create/contact/message retries are scoped to the account and reject payload conflicts',t=>{
   const {store}=fixture(t),{post}=store.create('owner',input(),key(1));
   assert.throws(()=>store.create('owner',input({role:'Plongeur'}),key(1)),error(409,'idempotency_conflict'));

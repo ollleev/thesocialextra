@@ -74,7 +74,7 @@ export function createEventPublishingUI({$, client, cities, getSession, getRoles
     if(action==='login')void onLogin();
     if(action==='new'){
       const record=active,entry=record.entry,need=entry.saved?.needs.find(n=>n.id===record.needId);
-      if(!need||client.current!==entry||record.flow.snapshot().phase!=='success')return;
+      if(!need||client.current!==entry||!['success','expired'].includes(record.flow.snapshot().phase))return;
       active=build(entry,need);records.set(keyFor(entry,need.id),active);render();onChange();content.querySelector('select')?.focus();
     }
   });
@@ -89,8 +89,8 @@ export function createEventPublishingUI({$, client, cities, getSession, getRoles
     const blocked=entry.busy||entry.intent||entry.conflict||entry.gone||client.dirty(entry)||!getRoles().length;
     return `<section class="event-publish-needs"><h2>Publier un besoin</h2><p class="event-help">Relisez chaque annonce avant de la publier. L’événement et ses consignes restent privés. Chaque annonce couvre jusqu’à 8 places ; aucun découpage automatique.</p>${client.dirty(entry)?'<p class="event-help">Enregistrez vos modifications avant de préparer une nouvelle annonce.</p>':''}${entry.saved.needs.map(need=>{
       const record=records.get(keyFor(entry,need.id)),phase=record?.flow.snapshot().phase;
-      const resume=phase==='uncertain'||phase==='success'||phase==='sending';
-      const label=phase==='uncertain'?'Vérifier la publication':phase==='sending'?'Publication en cours…':phase==='success'?'Voir la publication':'Préparer une annonce';
+      const resume=phase==='uncertain'||phase==='success'||phase==='sending'||phase==='expired';
+      const label=phase==='uncertain'?'Vérifier la publication':phase==='sending'?'Publication en cours…':phase==='success'?'Voir la publication':phase==='expired'?'Tentative terminée':'Préparer une annonce';
       return `<div class="event-publish-need"><div><strong>${esc(need.role)}</strong><span>${need.quantity-need.confirmed} personne${need.quantity-need.confirmed>1?'s':''} restante${need.quantity-need.confirmed>1?'s':''} selon vos confirmations</span></div><button type="button" class="button outline" data-event-action="publish" data-id="${esc(need.id)}" ${!resume&&(blocked||need.quantity===need.confirmed)?'disabled':''}>${label}</button></div>`;
     }).join('')}</section>`;
   }

@@ -76,6 +76,6 @@ export function prepareEventPost(plan, needId, options) {
     else if (need.languages.en === 'preferred') note += ' Anglais souhaité.';
     if (extra) note += ` ${extra}`;
     if (note.length > 180) return bad('event_note_too_long');
-    return { ok: true, draft: { kind: 'need', role: need.role, cityId: plan.cityId, english: need.languages.en === 'required', vehicle: false, durationMinutes, places, note }, source: { planId: plan.id, revision: plan.revision, needId: need.id }, remaining, allowedDurations };
+    return { ok: true, draft: { kind: 'need', role: need.role, cityId: plan.cityId, english: need.languages.en === 'required', vehicle: false, durationMinutes, notAfter: plan.endsAt, places, note }, source: { planId: plan.id, revision: plan.revision, needId: need.id }, remaining, allowedDurations };
   } catch { return bad('event_draft_invalid'); }
 }

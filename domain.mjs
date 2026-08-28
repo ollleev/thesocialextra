@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { normalizePostDeadline, resolvePostExpiry } from './post-expiry.mjs';
 import { getLocation, pointForLocation, LocationError } from './locations.mjs';
 
 export const ZONES = Object.freeze([
@@ -48,7 +49,7 @@ function text(value, max, required = false) {
   return value.trim();
 }
 function validatePost(input) {
-  fields(input, ['kind', 'role', 'zoneId', 'cityId', 'point', 'english', 'vehicle', 'durationMinutes', 'places', 'pay', 'note']);
+  fields(input, ['kind', 'role', 'zoneId', 'cityId', 'point', 'english', 'vehicle', 'durationMinutes', 'places', 'pay', 'note', 'notAfter']);
   if (!['available', 'need'].includes(input.kind)) fail(400, 'invalid_kind');
   if (!ROLES.includes(input.role)) fail(400, 'invalid_role');
   let location;
@@ -77,7 +78,10 @@ function validatePost(input) {
   if (typeof input.english !== 'boolean' || typeof input.vehicle !== 'boolean') fail(400, 'invalid_checklist');
   if (input.kind === 'need' && (!Number.isInteger(input.places) || input.places < 1 || input.places > 8)) fail(400, 'invalid_places');
   if (input.pay !== undefined && input.pay !== null && (typeof input.pay !== 'number' || !Number.isFinite(input.pay) || input.pay < 8 || input.pay > 100)) fail(400, 'invalid_pay');
+  const deadline = normalizePostDeadline(input.notAfter);
+  if (!deadline.ok) fail(400, deadline.code);
   return { kind: input.kind, role: input.role, ...location,
+    ...(deadline.notAfter === undefined ? {} : { notAfter: deadline.notAfter }),
     english: input.english, vehicle: input.vehicle, places: input.kind === 'need' ? input.places : 1,
     pay: input.pay ?? null, note: text(input.note, 180), durationMinutes: input.durationMinutes };
 }
@@ -146,10 +150,13 @@ export class LiveStore {
     this.sweep();
     if (this.posts.size >= this.limits.maxPosts) fail(429, 'post_capacity_reached');
     const now = this.clock();
+    const expiry = resolvePostExpiry(data.durationMinutes, data.notAfter, now);
+    if (!expiry.ok) fail(expiry.code === 'post_deadline_elapsed' ? 410 : 400, expiry.code);
     const post = { ...data, id: randomUUID(), ownerToken: token(), totalPlaces: data.places,
       createdAt: now - ageMinutes * 60_000, updatedAt: now - ageMinutes * 60_000,
-      expiresAt: now + data.durationMinutes * 60_000, status: 'open', revision: 0, demo };
+      expiresAt: expiry.expiresAt, status: 'open', revision: 0, demo };
     delete post.durationMinutes;
+    delete post.notAfter;
     this.posts.set(post.id, post);
     this.emit();
     return { post: publicPost(post), ownerToken: post.ownerToken };

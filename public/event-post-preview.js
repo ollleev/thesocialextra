@@ -2,6 +2,9 @@ const FRENCH_ERRORS = {
   event_draft_invalid: 'Le brouillon est invalide.',
   event_draft_unavailable: 'Le brouillon n’est plus disponible.',
   event_finished: 'L’événement est terminé.',
+  post_deadline_elapsed: 'La date limite est dépassée. Aucune nouvelle annonce n’a été créée par cette reprise.',
+  post_expired: 'L’annonce de cette tentative a déjà expiré.',
+  invalid_post_deadline: 'La date limite de l’annonce est invalide.',
   event_need_full: 'Le besoin est complet.',
   event_places_required: 'Indiquez le nombre de places.',
   event_places_invalid: 'Le nombre de places est invalide.',
@@ -102,7 +105,7 @@ export class EventPostPreviewState {
   }
 
   edit(partial) {
-    if (this._busy || this._phase === 'uncertain' || this._phase === 'success') return false;
+    if (this._busy || this._phase === 'uncertain' || this._phase === 'success' || this._phase === 'expired') return false;
     const next = clone(this._options);
     const clonedPartial = clone(partial);
     for (const key of ['places', 'durationMinutes', 'extraNote']) {
@@ -120,7 +123,7 @@ export class EventPostPreviewState {
 
   async publish() {
     if (this._busy) return false;
-    if (this._phase === 'success') return false;
+    if (this._phase === 'success' || this._phase === 'expired') return false;
     if (this._phase === 'uncertain') {
       if (!this._intent) return false;
       this._busy = true;
@@ -202,6 +205,15 @@ export class EventPostPreviewState {
     const status = err && typeof err.status === 'number' ? err.status : null;
     const isIntegerStatus = status !== null && Number.isInteger(status);
     const definitive = (err && err.definitive === true) || (isIntegerStatus && status >= 400 && status <= 499);
+    if (status === 410 && ['post_deadline_elapsed', 'post_expired'].includes(code)) {
+      // The immutable deadline or the stored post has expired. Keep the intent,
+      // but never turn this response into a new key or another automatic send.
+      this._busy = false;
+      this._phase = 'expired';
+      this._errorCode = code;
+      this._notify();
+      return;
+    }
     // A refusal of a retry does not prove that the original request failed.
     // Retain its exact key/body until its outcome is actually confirmed.
     if (definitive && !retry) {
@@ -274,7 +286,7 @@ export function renderEventPostPreview(view) {
   if (ok && draft) {
     const summaryPlaces = draft.places !== undefined ? draft.places : '';
     const summaryDuration = draft.durationMinutes !== undefined ? draft.durationMinutes : '';
-    html += '<p class="event-help">Résumé : ' + escapeHtml(summaryPlaces) + ' places, visible pendant ' + escapeHtml(summaryDuration) + ' minutes.</p>';
+    html += '<p class="event-help">Résumé : ' + escapeHtml(summaryPlaces) + ' places, visible jusqu’à ' + escapeHtml(summaryDuration) + ' minutes, sans dépasser la fin de l’événement.</p>';
   }
 
   if (phase === 'success') {
@@ -283,6 +295,13 @@ export function renderEventPostPreview(view) {
     html += '<button type="button" class="button lime" data-preview-action="view">Voir mon annonce</button>';
     html += '<button type="button" class="button outline" data-preview-action="new">Préparer une autre annonce</button>';
     html += '</div>';
+    return html;
+  }
+
+  if (phase === 'expired') {
+    html += '<p role="status">Cette tentative est terminée. Consultez vos annonces pour retrouver une éventuelle publication antérieure.</p>';
+    if (errorText) html += '<p class="form-error" role="alert">' + escapeHtml(errorText) + '</p>';
+    html += '<button type="button" class="button outline" data-preview-action="new">Préparer une autre annonce</button>';
     return html;
   }
 
