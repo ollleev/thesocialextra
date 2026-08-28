@@ -86,6 +86,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
   authOptions={}, moderators=[], allowLocalHttp=false, trustedProxyAddresses=[], voiceSocketPath=null, testVoiceProcessor,
   rateLimit=240, mutationRateLimit=60, accountRateLimit=120, authRateLimit=15, authAccountRateLimit=10,
   rateWindowMs=60_000, authWindowMs=15*60_000, rateMaxEntries=10000,
+  maxBlocksPerUser=500, maxTotalBlocks=100000,
   maxStreams=256, maxStreamsPerIp=8, sweepIntervalMs=1000, heartbeatIntervalMs=15_000 }={}) {
   const {url:origin,secure}=configuredOrigin(publicOrigin,allowLocalHttp);
   if(voiceSocketPath!==null && (typeof voiceSocketPath!=='string'||!path.isAbsolute(voiceSocketPath)||voiceSocketPath.length>100||/[\0\r\n]/.test(voiceSocketPath))) throw new TypeError('A trusted absolute voice socket is required');
@@ -96,10 +97,11 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     if(!Number.isSafeInteger(value)||value<1) throw new TypeError('Limits and intervals must be positive integers');
   const trusted=new Set(trustedProxyAddresses.map(normalizeIp));
   if([...trusted].some(ip=>!isIP(ip))) throw new TypeError('Trusted proxies must be exact IP addresses');
-  const auth=new AuthService({...authOptions,db,clock}), store=new ProductionStore({db,clock,moderators});
+  const auth=new AuthService({...authOptions,db,clock}), store=new ProductionStore({db,clock,moderators,maxBlocksPerUser,maxTotalBlocks});
   const moderatorIds=new Set(moderators), cookieName=secure?'__Host-extra_session':'extra_session';
   const staticRoot=path.resolve(publicDir), rates=new Map(), streams=new Set();
-  let disposed=false, scheduled=false, broadcasting=false;
+  let disposed=false, scheduled=false, broadcasting=false, privateScheduled=false;
+  const privateReaders=new Set();
   function rate(key, limit, windowMs=rateWindowMs) {
     const now=clock();
     // A bounded map also bounds random-username attacks on the authentication limiter.
@@ -152,6 +154,20 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     });
   }
   const unsubscribe=store.subscribe(scheduleState);
+  const unsubscribePrivate=store.subscribePrivate(userId=>{
+    if(disposed)return;
+    privateReaders.add(userId);
+    if(privateScheduled)return;
+    privateScheduled=true;
+    queueMicrotask(()=>{
+      privateScheduled=false;
+      const readers=new Set(privateReaders);privateReaders.clear();
+      if(disposed)return;
+      // A reader's block must refresh all of their sessions, but reveal neither
+      // its occurrence nor a version change to anonymous or unrelated streams.
+      for(const stream of streams)if(readers.has(stream.userId))sendState(stream);
+    });
+  });
   const server=http.createServer(async(req,res)=>{
     securityHeaders(res,secure,Boolean(voiceSocketPath));
     try {
@@ -173,6 +189,13 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       const currentUserId=()=>requireUser(auth.session(token));
       if(user&&pathname.startsWith('/api/')) rate(`account:${user.id}`,accountRateLimit);
       if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id)),...(voiceSocketPath?{features:{voice:true}}:{})});
+      if(req.method==='GET'&&pathname==='/api/blocks') {
+        const actor=requireUser(user);
+        for(const name of searchParams.keys())if(name!=='cursor'||searchParams.getAll(name).length!==1)fail(400,'invalid_cursor');
+        return json(res,200,store.listBlocks(actor,{cursor:searchParams.get('cursor')}));
+      }
+      const blockRoute=pathname.match(/^\/api\/blocks\/([a-f0-9-]{36})$/);
+      if(req.method==='DELETE'&&blockRoute)return json(res,200,store.unblock(requireUser(user),blockRoute[1]));
       const authRoute=pathname.match(/^\/api\/auth\/(register|login|recover|logout)$/);
       if(req.method==='POST'&&authRoute) {
         const action=authRoute[1];if(action!=='logout')rate(`auth-ip:${ip}`,authRateLimit,authWindowMs);
@@ -216,14 +239,15 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
         if(input.cursor!==undefined&&input.cursor!==null&&(typeof input.cursor!=='string'||input.cursor.length>180))fail(400,'invalid_cursor');
         return json(res,200,store.updates(currentUserId(),input));
       }
-      const postRoute=pathname.match(/^\/api\/posts\/([a-zA-Z0-9-]{1,80})(?:\/(contact|threads))?$/);
+      const postRoute=pathname.match(/^\/api\/posts\/([a-zA-Z0-9-]{1,80})(?:\/(contact|threads|block))?$/);
       if(postRoute) {
         const [,id,operation]=postRoute;
-        if(req.method==='GET'&&!operation)return json(res,200,store.getPublicPost(id));
+        if(req.method==='GET'&&!operation)return json(res,200,store.getPublicPost(id,user?.id));
         const actor=requireUser(user);
         if(req.method==='PATCH'&&!operation) { const key=intentKey(req),input=await body(req);return json(res,200,store.mutate(currentUserId(),id,input,key)); }
         if(req.method==='DELETE'&&!operation) { store.remove(actor,id);res.writeHead(204);return res.end(); }
         if(req.method==='POST'&&operation==='contact') { const key=intentKey(req),input=await body(req);return json(res,201,store.contact(currentUserId(),id,input,key)); }
+        if(req.method==='POST'&&operation==='block') { const input=await body(req);fields(input,[]);return json(res,200,store.blockPost(currentUserId(),id)); }
         if(req.method==='GET'&&operation==='threads') {
           const row=store.postRow(id);if(row.owner_id!==actor)fail(403,'owner_required');
           const post=JSON.parse(row.data);
@@ -284,7 +308,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
   function failStreams() { for(const stream of streams)stream.res.end('event: unavailable\ndata: {}\n\n');streams.clear(); }
   const sweepTimer=setInterval(()=>{try{store.sweep();}catch{failStreams();}},sweepIntervalMs);sweepTimer.unref();
   const heartbeat=setInterval(()=>{for(const stream of streams)if(validStream(stream))stream.res.write(': heartbeat\n\n');},heartbeatIntervalMs);heartbeat.unref();
-  function dispose(){disposed=true;clearInterval(sweepTimer);clearInterval(heartbeat);unsubscribe();for(const stream of streams)stream.res.end();streams.clear();}
+  function dispose(){disposed=true;clearInterval(sweepTimer);clearInterval(heartbeat);unsubscribe();unsubscribePrivate();privateReaders.clear();for(const stream of streams)stream.res.end();streams.clear();}
   server.once('close',dispose);
   return {server,store,auth,async close(){dispose();if(!server.listening)return;await new Promise((resolve,reject)=>{server.close(error=>error?reject(error):resolve());server.closeAllConnections();});}};
 }

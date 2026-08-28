@@ -147,6 +147,73 @@ test('SSE is scoped, private changes remain private, and revoked/expired session
   const guestStream=await f.stream('/api/events',guest.cookie);await guestStream.next();f.advance(30*24*3600_000);assert.equal((await guestStream.next()).event,'session-expired');
 });
 
+test('public-author block HTTP contracts expose no account identity and remain manageable after expiry',async t=>{
+  const f=await fixture(t),owner=await f.register('public_block_owner'),reader=await f.register('public_block_reader'),other=await f.register('public_block_other');
+  const post=f.app.store.create(owner.data.user.id,input(),key()).post,route=`/api/posts/${post.id}/block`;
+  assert.equal((await f.request(route,{method:'POST',body:{}})).status,401);
+  assert.equal((await f.request(route,{method:'POST',cookie:reader.cookie,body:{},origin:false})).status,403);
+  assert.equal((await f.request(route,{method:'POST',cookie:reader.cookie,body:{userId:owner.data.user.id}})).status,400);
+  assert.equal((await f.request(route,{method:'POST',cookie:owner.cookie,body:{}})).data.error,'cannot_block_self');
+  const blocked=await f.request(route,{method:'POST',cookie:reader.cookie,body:{}});
+  assert.equal(blocked.status,200);assert.deepEqual(Object.keys(blocked.data).sort(),['blockId','feedRevision']);assert.equal(blocked.data.feedRevision,1);
+  assert.deepEqual((await f.request(route,{method:'POST',cookie:reader.cookie,body:{}})).data,blocked.data);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_threads').get().n,0);assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_messages').get().n,0);
+  assert.equal((await f.request(`/api/posts/${post.id}`,{cookie:reader.cookie})).status,404);
+  assert.deepEqual(Object.keys((await f.request(`/api/posts/${post.id}`)).data),['post']);
+  assert.equal((await f.request(`/api/posts/${post.id}`,{cookie:other.cookie})).data.feedRevision,0);
+  const state=await f.request('/api/state',{cookie:reader.cookie});assert.equal(state.data.posts.length,0);assert.equal(state.data.feedRevision,1);assert.equal(state.headers['cache-control'],'no-store');
+  assert.equal((await f.request('/api/state')).data.posts.length,1);
+  assert.equal((await f.request('/api/blocks')).status,401);
+  const listed=await f.request('/api/blocks',{cookie:reader.cookie});
+  assert.deepEqual(listed.data,{blocks:[{id:blocked.data.blockId,createdAt:1_800_000_000_000}],nextCursor:null,feedRevision:1});
+  assert.equal(listed.headers['cache-control'],'no-store');
+  for(const value of [owner.data.user.id,reader.data.user.id,'public_block_owner','blocked_id','blocker_id'])assert.ok(!listed.text.includes(value));
+  for(const query of ['?cursor=bad','?cursor=a&cursor=b','?userId=other'])assert.equal((await f.request('/api/blocks'+query,{cookie:reader.cookie})).status,400);
+  const unblock=`/api/blocks/${blocked.data.blockId}`;
+  assert.equal((await f.request(unblock,{method:'DELETE'})).status,401);
+  assert.deepEqual((await f.request(unblock,{method:'DELETE',cookie:other.cookie})).data,{feedRevision:0});
+  assert.equal((await f.request('/api/blocks',{cookie:reader.cookie})).data.blocks.length,1);
+  f.advance(30*60_000);assert.equal((await f.request(route,{method:'POST',cookie:reader.cookie,body:{}})).status,410);
+  f.advance(7*24*60*60_000);f.app.store.sweep();
+  const future=f.app.store.create(owner.data.user.id,input(),key()).post;
+  assert.equal((await f.request(`/api/posts/${future.id}`,{cookie:reader.cookie})).status,404);
+  assert.deepEqual((await f.request(unblock,{method:'DELETE',cookie:reader.cookie})).data,{feedRevision:2});
+  assert.deepEqual((await f.request(unblock,{method:'DELETE',cookie:reader.cookie})).data,{feedRevision:2});
+  const visible=await f.request(`/api/posts/${future.id}`,{cookie:reader.cookie});assert.equal(visible.status,200);assert.equal(visible.data.feedRevision,2);
+});
+
+test('private block invalidation reaches both reader sessions but neither anonymous nor other accounts',async t=>{
+  const f=await fixture(t),owner=await f.register('block_sse_owner'),reader=await f.register('block_sse_reader');
+  const second=await f.request('/api/auth/login',{method:'POST',body:{username:'block_sse_reader',password:PASSWORD}});assert.equal(second.status,200);
+  const post=f.app.store.create(owner.data.user.id,input(),key()).post;
+  const one=await f.stream('/api/events',reader.cookie),two=await f.stream('/api/events',second.cookie),anonymous=await f.stream(),unrelated=await f.stream('/api/events',owner.cookie);
+  for(const stream of [one,two,anonymous,unrelated])assert.equal((await stream.next()).data.posts.length,1);
+  const before=f.app.store.state().version;
+  const block=await f.request(`/api/posts/${post.id}/block`,{method:'POST',cookie:reader.cookie,body:{}});
+  for(const stream of [one,two]) {const snapshot=(await stream.next()).data;assert.equal(snapshot.posts.length,0);assert.equal(snapshot.feedRevision,1);assert.equal(snapshot.version,before);}
+  await new Promise(resolve=>setTimeout(resolve,50));assert.equal(anonymous.frames.length,0);assert.equal(unrelated.frames.length,0);assert.equal(f.app.store.state().version,before);
+  await f.request(`/api/posts/${post.id}/block`,{method:'POST',cookie:reader.cookie,body:{}});
+  await new Promise(resolve=>setTimeout(resolve,50));assert.equal(one.frames.length,0);assert.equal(two.frames.length,0);
+  f.app.store.create(owner.data.user.id,input(),key());
+  for(const stream of [one,two])assert.equal((await stream.next()).data.posts.length,0);
+  assert.equal((await anonymous.next()).data.posts.length,2);await unrelated.next();
+  await f.request(`/api/blocks/${block.data.blockId}`,{method:'DELETE',cookie:second.cookie});
+  for(const stream of [one,two]) {const snapshot=(await stream.next()).data;assert.equal(snapshot.posts.length,2);assert.equal(snapshot.feedRevision,2);}
+  await new Promise(resolve=>setTimeout(resolve,50));assert.equal(anonymous.frames.length,0);assert.equal(unrelated.frames.length,0);
+});
+
+test('HTTP block capacities are configurable, preserve existing entries and permit idempotent retries',async t=>{
+  const f=await fixture(t,{maxBlocksPerUser:1,maxTotalBlocks:2}),a=await f.register('block_cap_a'),b=await f.register('block_cap_b'),c=await f.register('block_cap_c');
+  const postA=f.app.store.create(a.data.user.id,input(),key()).post,postB=f.app.store.create(b.data.user.id,input(),key()).post;
+  const block=(user,post)=>f.request(`/api/posts/${post.id}/block`,{method:'POST',cookie:user.cookie,body:{}});
+  const first=await block(c,postA);assert.equal(first.status,200);assert.deepEqual((await block(c,postA)).data,first.data);
+  const ownCap=await block(c,postB);assert.equal(ownCap.status,429);assert.equal(ownCap.data.error,'block_capacity_reached');
+  const second=await block(a,postB);assert.equal(second.status,200);
+  const total=await block(b,postA);assert.equal(total.status,429);assert.equal(total.data.error,'total_block_capacity_reached');
+  assert.equal((await f.request('/api/blocks',{cookie:c.cookie})).data.blocks[0].id,first.data.blockId);
+  await f.request(`/api/blocks/${second.data.blockId}`,{method:'DELETE',cookie:a.cookie});assert.equal((await block(b,postA)).status,200);
+});
+
 test('IP/auth/account quotas are bounded and untrusted XFF cannot bypass them',async t=>{
   const f=await fixture(t,{authRateLimit:2});
   for(let i=0;i<2;i++)assert.equal((await f.request('/api/auth/login',{method:'POST',body:{username:'unknown',password:PASSWORD},headers:{'X-Forwarded-For':`192.0.2.${i+1}`}})).status,401);
@@ -197,27 +264,34 @@ test('moderation routes enforce moderator identity and removal',async t=>{
 });
 
 test('a slow request cannot mutate after its session is revoked during body upload',async t=>{
-  const f=await fixture(t),owner=await f.register('slow_owner'),payload=JSON.stringify(input());
+  for(const operation of ['create','block']) {
+  const f=await fixture(t),owner=await f.register('slow_owner'),payload=JSON.stringify(operation==='create'?input():{});
+  const post=operation==='block'?f.app.store.create('synthetic-target',input(),key()).post:null;
+  const route=post?`/api/posts/${post.id}/block`:'/api/posts';
   let pending;
   const accepted=new Promise(resolve=>f.app.server.once('request',resolve));
   const response=new Promise((resolve,reject)=>{
-    pending=http.request({hostname:'127.0.0.1',port:f.app.server.address().port,path:'/api/posts',method:'POST',headers:{Host:'extras.test',Origin:'https://extras.test',Cookie:owner.cookie,'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload),'Idempotency-Key':key()}},res=>{res.resume();res.on('end',()=>resolve(res.statusCode));});pending.on('error',reject);pending.write(payload.slice(0,1));
+    pending=http.request({hostname:'127.0.0.1',port:f.app.server.address().port,path:route,method:'POST',headers:{Host:'extras.test',Origin:'https://extras.test',Cookie:owner.cookie,'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload),'Idempotency-Key':key()}},res=>{res.resume();res.on('end',()=>resolve(res.statusCode));});pending.on('error',reject);pending.write(payload.slice(0,1));
   });
   await accepted;
   await f.request('/api/auth/logout',{method:'POST',cookie:owner.cookie,body:{}});
-  pending.end(payload.slice(1));assert.equal(await response,401);assert.equal(f.app.store.state().posts.length,0);
+  pending.end(payload.slice(1));assert.equal(await response,401);assert.equal(f.app.store.state().posts.length,post?1:0);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_blocks').get().n,0);
+  }
 });
 
 test('failed account cleanup rolls back business and auth data, and emits no state change',async t=>{
-  const f=await fixture(t),owner=await f.register('rollback_owner');
+  const f=await fixture(t),owner=await f.register('rollback_owner'),reader=await f.register('rollback_reader');
   const post=(await f.request('/api/posts',{method:'POST',cookie:owner.cookie,body:input(),headers:{'Idempotency-Key':key()}})).data.post;
+  const blocked=f.app.store.blockPost(reader.data.user.id,post.id),privateEvents=[];f.app.store.subscribePrivate(userId=>privateEvents.push(userId));
   const before=f.app.store.state().version;let events=0;f.app.store.subscribe(()=>events++);
   f.db.exec("CREATE TRIGGER fail_auth_delete BEFORE DELETE ON auth_users BEGIN SELECT RAISE(ABORT,'synthetic rollback'); END;");
   const result=await f.request('/api/account',{method:'DELETE',cookie:owner.cookie,body:{password:PASSWORD}});
   assert.equal(result.status,500);assert.equal(result.data.error,'internal_error');assert.ok(!result.text.includes('synthetic rollback'));
   assert.equal((await f.request('/api/session',{cookie:owner.cookie})).data.user.id,owner.data.user.id);
   assert.equal((await f.request(`/api/posts/${post.id}`)).status,200);assert.equal(f.app.store.state().version,before);assert.equal(events,0);
-  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_sessions').get().n,1);
+  assert.deepEqual(privateEvents,[]);assert.equal(f.app.store.listBlocks(reader.data.user.id).blocks[0].id,blocked.blockId);assert.equal(f.app.store.feedRevision(reader.data.user.id),1);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_sessions').get().n,2);
 });
 
 test('HTTP session expires exactly at its deadline and duplicate sensitive headers are rejected',async t=>{

@@ -20,20 +20,22 @@ export class ProductionStore {
     maxThreads = 10000, maxTotalMessages = 200000, maxTotalIntents = 250000, maxThreadsPerUser = 500,
     maxReports = 5000, maxReportEvidenceBytes = 16 * 1024, maxVoicesPerThread = 20,
     maxVoiceBytesPerUser = 20 * 1024 * 1024, maxTotalVoiceBytes = 200 * 1024 * 1024,
-    maxReportVoiceBytes = 50 * 1024 * 1024 } = {}) {
+    maxReportVoiceBytes = 50 * 1024 * 1024, maxBlocksPerUser = 500, maxTotalBlocks = 100000 } = {}) {
     // Pilot safety limits, not measured commercial capacity. All instances using
     // one database must be configured with the same limits.
     // Reports consume at most ~78 MiB of new evidence at these defaults, plus
     // row/index overhead. This is a pilot budget, not a measured service capacity.
     // Existing evidence is never shortened or evicted to satisfy a lower limit.
     const limits = { maxPosts, maxMessages, maxIntents, maxThreads, maxTotalMessages, maxTotalIntents, maxThreadsPerUser,
-      maxReports, maxReportEvidenceBytes, maxVoicesPerThread, maxVoiceBytesPerUser, maxTotalVoiceBytes, maxReportVoiceBytes };
+      maxReports, maxReportEvidenceBytes, maxVoicesPerThread, maxVoiceBytesPerUser, maxTotalVoiceBytes, maxReportVoiceBytes,
+      maxBlocksPerUser, maxTotalBlocks };
     for (const [name, value] of Object.entries(limits)) {
       if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer`);
     }
     this.db = db; this.clock = clock; this.moderators = new Set(moderators);
     Object.assign(this, limits);
-    this.listeners = new Set(); this.transactionDepth = 0; this.publicChanged = false;
+    this.listeners = new Set(); this.privateListeners = new Set(); this.privateChanged = new Set();
+    this.transactionDepth = 0; this.publicChanged = false;
     db.exec(`
       CREATE TABLE IF NOT EXISTS app_meta (id INTEGER PRIMARY KEY CHECK(id=1), epoch TEXT NOT NULL, version INTEGER NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS app_posts (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, data TEXT NOT NULL,
@@ -58,7 +60,9 @@ export class ProductionStore {
         reference_type TEXT, reference_id TEXT, revoked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(actor_id,scope,key)) STRICT;
       CREATE INDEX IF NOT EXISTS app_intents_reference ON app_intents(reference_type,reference_id);
       CREATE INDEX IF NOT EXISTS app_intents_expiry ON app_intents(expires_at);
-      CREATE TABLE IF NOT EXISTS app_blocks (blocker_id TEXT NOT NULL, blocked_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(blocker_id,blocked_id)) STRICT;
+      CREATE TABLE IF NOT EXISTS app_blocks (blocker_id TEXT NOT NULL, blocked_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+        id TEXT NOT NULL UNIQUE, PRIMARY KEY(blocker_id,blocked_id)) STRICT;
+      CREATE TABLE IF NOT EXISTS app_block_revisions (user_id TEXT PRIMARY KEY, revision INTEGER NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS app_reports (id TEXT PRIMARY KEY, reporter_id TEXT NOT NULL, target_type TEXT NOT NULL,
         target_id TEXT NOT NULL, reason TEXT NOT NULL, details TEXT NOT NULL, evidence TEXT NOT NULL,
         created_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open', resolved_at INTEGER, moderator_id TEXT) STRICT;
@@ -72,6 +76,23 @@ export class ProductionStore {
         bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 27 AND 524288), PRIMARY KEY(report_id,message_id)) STRICT;
       CREATE TABLE IF NOT EXISTS app_suspended_users (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;
     `);
+    // Preserve every legacy relationship, including blocks whose source content
+    // has expired. Handles identify only the caller's own block, not an account.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!db.prepare('PRAGMA table_info(app_blocks)').all().some(column => column.name === 'id')) {
+        db.exec(`CREATE TABLE app_blocks_migrated (blocker_id TEXT NOT NULL, blocked_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+          id TEXT NOT NULL UNIQUE, PRIMARY KEY(blocker_id,blocked_id)) STRICT;`);
+        const insert = db.prepare('INSERT INTO app_blocks_migrated(blocker_id,blocked_id,created_at,id) VALUES(?,?,?,?)');
+        for (const row of db.prepare('SELECT blocker_id,blocked_id,created_at FROM app_blocks').iterate()) {
+          insert.run(row.blocker_id,row.blocked_id,row.created_at,randomUUID());
+        }
+        db.exec('DROP TABLE app_blocks; ALTER TABLE app_blocks_migrated RENAME TO app_blocks;');
+      }
+      db.exec(`CREATE INDEX IF NOT EXISTS app_blocks_page ON app_blocks(blocker_id,created_at DESC,id DESC);
+        CREATE INDEX IF NOT EXISTS app_blocks_target ON app_blocks(blocked_id,blocker_id);`);
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
     // Attribution must survive moderation or normal expiry of the target. An
     // older report can be backfilled only while its post/thread still exists.
     // Never guess ownership from message text, or silently delete old evidence.
@@ -85,19 +106,22 @@ export class ProductionStore {
     db.prepare('INSERT OR IGNORE INTO app_meta VALUES(1,?,0)').run(randomUUID());
   }
   subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
+  subscribePrivate(fn) { this.privateListeners.add(fn); return () => this.privateListeners.delete(fn); }
   transaction(operation) {
     if (this.transactionDepth) return operation();
-    this.db.exec('BEGIN IMMEDIATE'); this.transactionDepth = 1; this.publicChanged = false;
-    let result, changed;
+    this.db.exec('BEGIN IMMEDIATE'); this.transactionDepth = 1; this.publicChanged = false; this.privateChanged.clear();
+    let result, changed, changedUsers;
     try {
       result = operation();
       if (result && typeof result.then === 'function') throw new Error('Transactions must be synchronous');
       changed = this.publicChanged;
+      changedUsers = [...this.privateChanged];
       if (changed) this.db.exec('UPDATE app_meta SET version=version+1 WHERE id=1');
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
-    finally { this.transactionDepth = 0; this.publicChanged = false; }
+    finally { this.transactionDepth = 0; this.publicChanged = false; this.privateChanged.clear(); }
     if (changed) for (const fn of this.listeners) { try { fn(); } catch { /* A dead subscriber cannot roll back a committed write. */ } }
+    for (const userId of changedUsers) for (const fn of this.privateListeners) { try { fn(userId); } catch { /* The write is already committed. */ } }
     return result;
   }
   sweep() {
@@ -117,6 +141,13 @@ export class ProductionStore {
   actor(userId) { if (typeof userId !== 'string' || !userId) fail(401, 'login_required'); }
   writer(userId) { this.actor(userId); if (this.db.prepare('SELECT id FROM app_suspended_users WHERE id=?').get(userId)) fail(403, 'account_suspended'); }
   blocked(a, b) { return Boolean(this.db.prepare('SELECT 1 FROM app_blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)').get(a,b,b,a)); }
+  blockedBy(userId, other) { return Boolean(this.db.prepare('SELECT 1 FROM app_blocks WHERE blocker_id=? AND blocked_id=?').get(userId,other)); }
+  feedRevision(userId) { this.actor(userId); return this.db.prepare('SELECT revision FROM app_block_revisions WHERE user_id=?').get(userId)?.revision ?? 0; }
+  changePrivateFeed(userId) {
+    this.db.prepare(`INSERT INTO app_block_revisions(user_id,revision) VALUES(?,1)
+      ON CONFLICT(user_id) DO UPDATE SET revision=revision+1`).run(userId);
+    this.privateChanged.add(userId);
+  }
   cachedIntent(userId, scope, key, payload) {
     validateIdempotencyKey(key);
     const fingerprint = createHash('sha256').update(canonical(payload)).digest('hex');
@@ -153,14 +184,21 @@ export class ProductionStore {
     const { point: origin } = pointForLocation(cityId,point);
     if (mine) this.actor(userId);
     const rows = mine ? this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 201').all(userId,this.clock())
-      : this.db.prepare('SELECT data FROM app_posts WHERE expired=0 AND lat BETWEEN ? AND ? AND expires_at>? ORDER BY expires_at DESC').all(origin.lat-0.23,origin.lat+0.23,this.clock());
+      : this.db.prepare(`SELECT data FROM app_posts p WHERE expired=0 AND lat BETWEEN ? AND ? AND expires_at>?
+          AND NOT EXISTS(SELECT 1 FROM app_blocks b WHERE b.blocker_id=? AND b.blocked_id=p.owner_id)
+          ORDER BY expires_at DESC`).all(origin.lat-0.23,origin.lat+0.23,this.clock(),userId);
     const candidates = rows.map(parse).filter(post => mine || (post.status==='open' && distanceKm(origin,post)<=25)).sort((a,b)=>b.createdAt-a.createdAt);
     const meta=this.db.prepare('SELECT epoch,version FROM app_meta WHERE id=1').get();
     return { posts:candidates.slice(0,200).map(publicPost), now:this.clock(), mode:'production', ...meta,
       scope:JSON.stringify({cityId,point:point??null,mine}), truncated:candidates.length>200,
-      ...(userId?{ownedPostIds:this.ownership(userId),ownedPosts:this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 10').all(userId,this.clock()).map(parse).map(publicPost)}:{}) };
+      ...(userId?{feedRevision:this.feedRevision(userId),ownedPostIds:this.ownership(userId),ownedPosts:this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 10').all(userId,this.clock()).map(parse).map(publicPost)}:{}) };
   }
-  getPublicPost(id) { return { post:publicPost(parse(this.livePost(id))) }; }
+  getPublicPost(id, userId=null) {
+    const row=this.postRow(id);
+    if(userId && this.blockedBy(userId,row.owner_id)) fail(404,'post_not_found');
+    if(row.expires_at<=this.clock()) fail(410,'post_expired');
+    return { post:publicPost(parse(row)), ...(userId?{feedRevision:this.feedRevision(userId)}:{}) };
+  }
   create(userId,input,key) {
     this.writer(userId); const data=validatePost(input); this.sweep();
     return this.transaction(()=>{
@@ -353,12 +391,58 @@ export class ProductionStore {
     }),unavailable:[],nextCursor:candidates.length>200?Buffer.from(JSON.stringify([last.created_at,last.id])).toString('base64url'):null};
   }
   ownership(userId) { this.actor(userId); return this.db.prepare('SELECT id FROM app_posts WHERE owner_id=? AND expires_at>?').all(userId,this.clock()).map(row=>row.id); }
+  setBlock(userId,other,blocked) {
+    this.actor(userId);
+    if(typeof blocked!=='boolean') fail(400,'invalid_block');
+    if(userId===other) fail(400,'cannot_block_self');
+    return this.transaction(()=>{
+      let row=this.db.prepare('SELECT id FROM app_blocks WHERE blocker_id=? AND blocked_id=?').get(userId,other);
+      if(blocked && !row) {
+        // Existing blocks are never evicted when a quota is reached or lowered.
+        if(this.db.prepare('SELECT COUNT(*) n FROM app_blocks WHERE blocker_id=?').get(userId).n>=this.maxBlocksPerUser) fail(429,'block_capacity_reached');
+        if(this.db.prepare('SELECT COUNT(*) n FROM app_blocks').get().n>=this.maxTotalBlocks) fail(429,'total_block_capacity_reached');
+        row={id:randomUUID()};
+        this.db.prepare('INSERT INTO app_blocks(blocker_id,blocked_id,created_at,id) VALUES(?,?,?,?)').run(userId,other,this.clock(),row.id);
+        this.changePrivateFeed(userId);
+      } else if(!blocked && row) {
+        this.db.prepare('DELETE FROM app_blocks WHERE blocker_id=? AND blocked_id=?').run(userId,other);
+        this.changePrivateFeed(userId); row=null;
+      }
+      return {blockId:row?.id??null,feedRevision:this.feedRevision(userId)};
+    });
+  }
+  blockPost(userId,postId) {
+    this.actor(userId);
+    return this.transaction(()=>this.setBlock(userId,this.livePost(postId).owner_id,true));
+  }
+  listBlocks(userId,{cursor}={}) {
+    this.actor(userId);
+    let before=Number.MAX_SAFE_INTEGER,beforeId='~';
+    if(cursor!==undefined && cursor!==null) {
+      if(typeof cursor!=='string'||cursor.length>180) fail(400,'invalid_cursor');
+      let parsed;
+      try { parsed=JSON.parse(Buffer.from(cursor,'base64url').toString()); } catch { fail(400,'invalid_cursor'); }
+      if(!Array.isArray(parsed)||parsed.length!==2||!Number.isSafeInteger(parsed[0])||parsed[0]<0||typeof parsed[1]!=='string'||!/^[a-f0-9-]{36}$/.test(parsed[1])) fail(400,'invalid_cursor');
+      [before,beforeId]=parsed;
+    }
+    const candidates=this.db.prepare(`SELECT id,created_at AS createdAt FROM app_blocks
+      WHERE blocker_id=? AND (created_at<? OR (created_at=? AND id<?)) ORDER BY created_at DESC,id DESC LIMIT 101`).all(userId,before,before,beforeId);
+    const blocks=candidates.slice(0,100),last=blocks.at(-1);
+    return {blocks,nextCursor:candidates.length>100?Buffer.from(JSON.stringify([last.createdAt,last.id])).toString('base64url'):null,feedRevision:this.feedRevision(userId)};
+  }
+  unblock(userId,blockId) {
+    this.actor(userId);
+    return this.transaction(()=>{
+      const removed=this.db.prepare('DELETE FROM app_blocks WHERE blocker_id=? AND id=?').run(userId,blockId).changes;
+      if(removed) this.changePrivateFeed(userId);
+      return {feedRevision:this.feedRevision(userId)};
+    });
+  }
   block(userId,threadId,blocked=true) {
     const row=this.threadAccess(userId,threadId),other=row.side==='owner'?row.guest_id:row.owner_id;
     if(typeof blocked!=='boolean') fail(400,'invalid_block');
-    if(blocked) this.db.prepare('INSERT OR IGNORE INTO app_blocks VALUES(?,?,?)').run(userId,other,this.clock());
-    else this.db.prepare('DELETE FROM app_blocks WHERE blocker_id=? AND blocked_id=?').run(userId,other);
-    return {blocked:this.blocked(userId,other)};
+    const {feedRevision}=this.setBlock(userId,other,blocked);
+    return {blocked:this.blocked(userId,other),blockedByMe:this.blockedBy(userId,other),feedRevision};
   }
   reportEvidence(userId,targetType,targetId) {
     if(targetType==='post') {
@@ -463,7 +547,11 @@ export class ProductionStore {
         this.deletePost(id);
       }
       this.db.prepare('DELETE FROM app_intents WHERE actor_id=?').run(userId);
+      const affected=this.db.prepare('SELECT blocker_id FROM app_blocks WHERE blocked_id=? AND blocker_id<>?').all(userId,userId);
       this.db.prepare('DELETE FROM app_blocks WHERE blocker_id=? OR blocked_id=?').run(userId,userId);
+      for(const {blocker_id} of affected) this.changePrivateFeed(blocker_id);
+      this.db.prepare('DELETE FROM app_block_revisions WHERE user_id=?').run(userId);
+      this.privateChanged.delete(userId);
       this.db.prepare('DELETE FROM app_reports WHERE reporter_id=?').run(userId);
       this.db.prepare('DELETE FROM app_suspended_users WHERE id=?').run(userId);
       this.publicChanged ||= posts.length>0;

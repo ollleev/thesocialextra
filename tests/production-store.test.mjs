@@ -109,6 +109,138 @@ test('a blocked counterpart cannot contact or send; unblocking only removes the 
   store.addMessage('guest',chat.threadId,{message:'Autorisé.'},key(5));
 });
 
+test('blocking a public author needs no conversation, hides only outgoing targets and is idempotent',t=>{
+  const {store,db}=fixture(t);
+  const a=store.create('author',input(),key('public-block-a')).post;
+  const b=store.create('author',input(),key('public-block-b')).post;
+  const other=store.create('other',input(),key('public-block-other')).post;
+  const own=store.create('reader',input(),key('public-block-own')).post;
+  const publicBefore=store.state(),events=[],privateEvents=[];
+  store.subscribe(()=>events.push(true));store.subscribePrivate(userId=>privateEvents.push(userId));
+  assert.throws(()=>store.blockPost(null,a.id),error(401,'login_required'));
+  assert.throws(()=>store.blockPost('reader',own.id),error(400,'cannot_block_self'));
+  const result=store.blockPost('reader',a.id);
+  assert.match(result.blockId,/^[a-f0-9-]{36}$/);assert.equal(result.feedRevision,1);
+  assert.deepEqual(store.blockPost('reader',a.id),result);
+  assert.deepEqual(store.blockPost('reader',b.id),result);
+  assert.deepEqual(privateEvents,['reader']);assert.deepEqual(events,[]);
+  assert.deepEqual(store.state(),publicBefore);
+  assert.deepEqual(store.state({},'reader').posts.map(p=>p.id).sort(),[other.id,own.id].sort());
+  assert.equal(store.state({},'other').posts.length,4);
+  assert.equal(store.state({},'author').posts.some(p=>p.id===own.id),true);
+  assert.deepEqual(store.state({mine:true},'reader').posts.map(p=>p.id),[own.id]);
+  assert.throws(()=>store.getPublicPost(a.id,'reader'),error(404,'post_not_found'));
+  assert.equal(store.getPublicPost(a.id).post.id,a.id);
+  assert.equal(store.getPublicPost(other.id,'reader').feedRevision,1);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM app_threads').get().n,0);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM app_messages').get().n,0);
+  assert.deepEqual(store.unblock('other',result.blockId),{feedRevision:0});
+  assert.deepEqual(store.unblock('reader',result.blockId),{feedRevision:2});
+  assert.deepEqual(store.unblock('reader',result.blockId),{feedRevision:2});
+  assert.equal(store.getPublicPost(a.id,'reader').post.id,a.id);
+  assert.deepEqual(privateEvents,['reader','reader']);
+});
+
+test('outgoing author filtering happens before the feed limit and truncated count',t=>{
+  const f=fixture(t),{store}=f;
+  store.transaction(()=>{
+    for(let i=0;i<200;i++)store.create(`visible-${Math.floor(i/10)}`,input(),key(`feed-visible-${i}`));
+    f.advance(1);
+    const hidden=store.create('hidden-author',input(),key('feed-hidden')).post;
+    store.blockPost('reader',hidden.id);
+  });
+  assert.equal(store.state().truncated,true);
+  const filtered=store.state({},'reader');
+  assert.equal(filtered.posts.length,200);assert.equal(filtered.truncated,false);
+  assert.ok(filtered.posts.every(post=>store.getPublicPost(post.id,'reader').post.id===post.id));
+});
+
+test('block handles outlive source expiry, deletion and moderation and still govern future posts',t=>{
+  for(const removal of ['expiry','delete','moderation']) {
+    const f=fixture(t),{store}=f,post=store.create('author',input(),key('durable-block-post')).post;
+    const chat=store.contact('reader',post.id,{message:'Synthetic contact.'},key('durable-block-chat'));
+    assert.deepEqual(store.block('reader',chat.threadId,true),{blocked:true,blockedByMe:true,feedRevision:1});
+    const handle=store.listBlocks('reader').blocks[0];
+    if(removal==='expiry') {
+      f.advance(30*60_000);
+      assert.throws(()=>store.blockPost('reader',post.id),error(410,'post_expired'));
+      assert.throws(()=>store.getPublicPost(post.id,'reader'),error(404,'post_not_found'));
+      f.advance(PRIVATE_RETENTION_MS);store.sweep();
+    } else if(removal==='delete') store.remove('author',post.id);
+    else {
+      const report=store.report('reader',{targetType:'post',targetId:post.id,reason:'other'},key('durable-block-report'));
+      store.resolveReport('moderator',report.id,'remove');
+    }
+    assert.throws(()=>store.block('reader',chat.threadId,false),error(404,'thread_not_found'));
+    assert.deepEqual(store.listBlocks('reader').blocks,[handle]);
+    const future=store.create('author',input(),key('durable-block-future')).post;
+    assert.throws(()=>store.getPublicPost(future.id,'reader'),error(404,'post_not_found'));
+    assert.deepEqual(store.unblock('reader',handle.id),{feedRevision:2});
+    assert.equal(store.getPublicPost(future.id,'reader').post.id,future.id);
+  }
+});
+
+test('legacy block migration preserves all pairs and timestamps, stable opaque handles and lower quotas',t=>{
+  const f=fixture(t),before=f.store.state().version;
+  f.db.exec(`DROP TABLE app_blocks;
+    CREATE TABLE app_blocks (blocker_id TEXT NOT NULL,blocked_id TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(blocker_id,blocked_id)) STRICT;
+    INSERT INTO app_blocks VALUES('reader','expired-author',123),('reader','removed-author',124),('other','reader',125);`);
+  const exec=f.db.exec.bind(f.db);
+  f.db.exec=sql=>{
+    if(sql.startsWith('DROP TABLE app_blocks; ALTER')) {exec('DROP TABLE app_blocks');throw new Error('synthetic migration interruption');}
+    return exec(sql);
+  };
+  try {assert.throws(()=>new ProductionStore({db:f.db}),/synthetic migration interruption/);}
+  finally {f.db.exec=exec;}
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_blocks').get().n,3);
+  assert.equal(f.db.prepare('PRAGMA table_info(app_blocks)').all().some(column=>column.name==='id'),false);
+  assert.equal(f.db.prepare("SELECT name FROM sqlite_schema WHERE name='app_blocks_migrated'").get(),undefined);
+  const migrated=new ProductionStore({db:f.db,maxBlocksPerUser:1});
+  const rows=f.db.prepare('SELECT blocker_id,blocked_id,created_at FROM app_blocks ORDER BY created_at').all();
+  assert.deepEqual(rows.map(row=>[row.blocker_id,row.blocked_id,row.created_at]),[['reader','expired-author',123],['reader','removed-author',124],['other','reader',125]]);
+  const handles=migrated.listBlocks('reader').blocks;
+  assert.equal(handles.length,2);assert.equal(new Set(handles.map(row=>row.id)).size,2);
+  assert.ok(handles.every(row=>/^[a-f0-9-]{36}$/.test(row.id)));
+  assert.equal(migrated.state().version,before);
+  const fresh=migrated.create('fresh-author',input(),key('legacy-block-cap')).post;
+  assert.throws(()=>migrated.blockPost('reader',fresh.id),error(429,'block_capacity_reached'));
+  f.reopen();assert.deepEqual(f.store.listBlocks('reader').blocks,handles);
+  assert.throws(()=>f.db.prepare('INSERT INTO app_blocks(blocker_id,blocked_id,created_at,id) VALUES(?,?,?,?)').run('new','target',1,null),/NOT NULL/);
+  assert.deepEqual(f.store.unblock('reader',handles[0].id),{feedRevision:1});
+  assert.equal(f.store.listBlocks('reader').blocks.length,1);
+});
+
+test('block quotas reject additions without eviction and private invalidations occur only after commit',t=>{
+  const f=fixture(t,{maxBlocksPerUser:1,maxTotalBlocks:2}),{store}=f;
+  const a=store.create('author-a',input(),key('block-quota-a')).post;
+  const b=store.create('author-b',input(),key('block-quota-b')).post;
+  const events=[],publicEvents=[];store.subscribePrivate(userId=>events.push({userId,revision:store.feedRevision(userId)}));store.subscribe(()=>publicEvents.push(true));
+  const first=store.blockPost('reader',a.id);
+  assert.deepEqual(store.blockPost('reader',a.id),first);
+  assert.throws(()=>store.blockPost('reader',b.id),error(429,'block_capacity_reached'));
+  const second=store.blockPost('other',a.id);
+  assert.throws(()=>store.blockPost('third',a.id),error(429,'total_block_capacity_reached'));
+  assert.equal(store.listBlocks('reader').blocks[0].id,first.blockId);
+  assert.deepEqual(store.blockPost('other',a.id),second);
+  assert.throws(()=>store.transaction(()=>{store.unblock('reader',first.blockId);store.blockPost('reader',b.id);throw new Error('synthetic rollback');}),/synthetic rollback/);
+  assert.equal(store.listBlocks('reader').blocks[0].id,first.blockId);assert.equal(store.feedRevision('reader'),1);
+  assert.deepEqual(events,[{userId:'reader',revision:1},{userId:'other',revision:1}]);assert.deepEqual(publicEvents,[]);
+  store.unblock('other',second.blockId);store.blockPost('third',b.id);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_blocks').get().n,2);
+});
+
+test('block list pagination is caller-scoped, content-free and stable across equal timestamps',t=>{
+  const {store}=fixture(t);
+  store.transaction(()=>{for(let i=0;i<101;i++)store.blockPost('reader',store.create(`author-${i}`,input(),key(`block-page-${i}`)).post.id);});
+  const first=store.listBlocks('reader'),second=store.listBlocks('reader',{cursor:first.nextCursor});
+  assert.equal(first.blocks.length,100);assert.equal(second.blocks.length,1);assert.equal(second.nextCursor,null);
+  assert.equal(new Set([...first.blocks,...second.blocks].map(row=>row.id)).size,101);
+  for(const row of [...first.blocks,...second.blocks])assert.deepEqual(Object.keys(row).sort(),['createdAt','id']);
+  assert.deepEqual(store.listBlocks('other',{cursor:first.nextCursor}).blocks,[]);
+  for(const cursor of ['bad',Buffer.from('{}').toString('base64url'),Buffer.from('[1,"bad-id"]').toString('base64url')])assert.throws(()=>store.listBlocks('reader',{cursor}),error(400,'invalid_cursor'));
+  assert.throws(()=>store.listBlocks(null),error(401,'login_required'));
+});
+
 test('reports are private, authorization is enforced, and moderator removal actually removes content',t=>{
   const {store}=fixture(t),{post}=store.create('owner',input(),key(1));
   const chat=store.contact('guest',post.id,{message:'Contact.'},key(2));
@@ -137,11 +269,16 @@ test('account erasure removes its public posts, conversations, access intents an
   f.store.addMessage('guest',chat.threadId,{message:'Private erase sentinel.'},key(3));
   f.store.report('guest',{targetType:'thread',targetId:chat.threadId,reason:'other'},key(4));
   f.store.block('guest',chat.threadId);
+  f.store.block('owner',chat.threadId);
+  const privateEvents=[];f.store.subscribePrivate(userId=>privateEvents.push(userId));
   f.store.eraseAccountData('owner');
   assert.equal(f.store.state().posts.length,0);
   assert.equal(f.store.updates('guest').threads.length,0);
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM app_messages').get().n,0);
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM app_blocks').get().n,0);
+  assert.equal(f.store.feedRevision('guest'),2);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_block_revisions WHERE user_id=?').get('owner').n,0);
+  assert.deepEqual(privateEvents,['guest']);
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM app_reports').get().n,0);
   assert.ok(!JSON.stringify(f.db.prepare('SELECT response FROM app_intents').all()).includes('Private erase sentinel'));
 });
@@ -235,7 +372,7 @@ test('conversation pagination never silently hides an active thread and stays st
 
 test('store safety limits reject non-positive, fractional, unsafe or nonnumeric values',t=>{
   const {db}=fixture(t);
-  for(const name of ['maxPosts','maxMessages','maxIntents','maxThreads','maxTotalMessages','maxTotalIntents','maxThreadsPerUser','maxReports','maxReportEvidenceBytes','maxVoicesPerThread','maxVoiceBytesPerUser','maxTotalVoiceBytes','maxReportVoiceBytes']) {
+  for(const name of ['maxPosts','maxMessages','maxIntents','maxThreads','maxTotalMessages','maxTotalIntents','maxThreadsPerUser','maxReports','maxReportEvidenceBytes','maxVoicesPerThread','maxVoiceBytesPerUser','maxTotalVoiceBytes','maxReportVoiceBytes','maxBlocksPerUser','maxTotalBlocks']) {
     for(const value of [0,-1,1.5,NaN,Infinity,'1',null,Number.MAX_SAFE_INTEGER+1]) {
       assert.throws(()=>new ProductionStore({db,[name]:value}),new RegExp(`${name} must be a positive safe integer`));
     }

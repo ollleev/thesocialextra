@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { VoiceComposer, uploadVoice } from '../public/voice.js';
-import { mergeSummary, freshPost } from '../public/updates.js';
+import { mergeSummary, freshPost, markRead } from '../public/updates.js';
 
 function fixture(options = {}) {
   let requests = 0, stopped = 0, time = 0, tick, instance, keys = 0;
@@ -102,6 +102,7 @@ function chatFixture(options={}) {
       getAttribute(name){return this.attributes[name]??null;},removeAttribute(name){delete this.attributes[name];},
       set src(value){this.attributes.src=value;},get src(){return this.attributes.src;},
       canPlayType:()=> 'probably',pause(){},load(){},querySelectorAll:()=>[],replaceChildren(){this.cleared=true;},
+      addEventListener(name,fn){this[name]=fn;},
     });
     return nodes.get(id);
   };
@@ -113,14 +114,16 @@ function chatFixture(options={}) {
     accountGeneration:1,privateRevision:1,updatesRequest:null,updatesError:false,updatesCheckedAt:0,chatRequest:0,chatReads:new Map(),chatTimer:1,
     clearInterval(){},api:async()=>({threads:[]}),outbox:{retain(){},get:()=>({error:null,busy:false})},now:()=>1000,
     saveSession(){},renderUpdates(){},renderInbox(){},render(){},setConnection(){},errorText:error=>error.code,
-    renderChatMessages(){messageRenders++;},mergeSummary,freshPost,lastSnapshot:null,owners:{},mutationKeys:new Map(),
+    renderChatMessages(){messageRenders++;},mergeSummary,freshPost,markRead,lastSnapshot:null,owners:{},mutationKeys:new Map(),
   });
   vm.runInContext([
+    appFunction('function applyFeedRevision(','function receive('),
     appFunction('function receive(data)','function openDialog('),
     appFunction('async function pollUpdates()','async function openInbox()'),
     appFunction('function stopAudio(','function reportVoiceMarkup('),
     appFunction('function renderVoice()','function renderChatMessages('),
     appFunction('function refreshChat()','async function openChat('),
+    appFunction("$('#voice-record').addEventListener(","$('#voice-stop').addEventListener("),
   ].join('\n'),context);
   return {...f,$,context,mediaPauses:()=>mediaPauses,mediaLoads:()=>mediaLoads,messageRenders:()=>messageRenders};
 }
@@ -176,4 +179,26 @@ test('public announcement expiry does not discard a still-valid private conversa
   assert.equal(f.$('#voice-composer').hidden,false);assert.equal(f.$('#chat-form').hidden,false);
   assert.equal(f.$('#chat-input').value,'synthetic text draft');assert.equal(f.mediaPauses(),0);
   f.composer.discard();
+});
+
+test('privacy revision stops capture and prevents restarting the real microphone handler until checked',async()=>{
+  const f=chatFixture();await f.composer.start();f.context.applyFeedRevision({feedRevision:1});
+  assert.equal(f.composer.phase,'idle');assert.equal(f.stopped(),1);assert.equal(f.$('#voice-record').disabled,true);
+  f.$('#voice-record').click();await Promise.resolve();assert.equal(f.composer.phase,'idle');
+  assert.equal(f.context.state.chatPrivacyPending,true);
+  f.context.api=async()=>({thread:{blocked:true,blockedByMe:true,incomingCount:0,messages:[],updatedAt:1000}});
+  await f.context.refreshChat();assert.equal(f.context.state.chatPrivacyPending,false);assert.equal(f.$('#voice-record').disabled,true);
+  f.$('#voice-record').click();await Promise.resolve();assert.equal(f.composer.phase,'idle');
+});
+
+test('a ready voice survives an unrelated block revision but is erased if its conversation is blocked',async t=>{
+  for(const blocked of [false,true])await t.test(String(blocked),async()=>{
+    const f=chatFixture();await f.composer.start();f.recorder().data();f.composer.stop();const blob=f.composer.blob;
+    assert.equal(f.composer.phase,'ready');f.context.applyFeedRevision({feedRevision:1});
+    assert.equal(f.composer.blob,blob);assert.equal(f.$('#voice-send').disabled,true);
+    f.context.api=async()=>({thread:{blocked,blockedByMe:blocked,incomingCount:0,messages:[],updatedAt:1000}});
+    await f.context.refreshChat();
+    assert.equal(f.composer.phase,blocked?'idle':'ready');assert.equal(f.composer.blob,blocked?null:blob);
+    if(!blocked)assert.equal(f.$('#voice-send').disabled,false);f.composer.discard();
+  });
 });

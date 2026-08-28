@@ -100,3 +100,40 @@ test('account deletion access precedes the feed, survives outages, and takes pre
     if(!options.sessionFails&&!options.feedFails)assert.equal(f.parsedURL(),'https://extras.test/');
   }
 });
+
+function privacyFixture() {
+  const nodes=new Map(),$=id=>{if(!nodes.has(id))nodes.set(id,{open:false,close(){this.open=false;},replaceChildren(){this.cleared=true;}});return nodes.get(id);};
+  $('#detail').open=true;
+  let discards=0,renders=0,detailUpdates=0;
+  const context=vm.createContext({$,state:{production:true,user:{id:'reader'},feedRevision:0,posts:[{id:'mine'},{id:'other'}],detailId:'other',detailPost:{id:'other'},chat:null},
+    accountGeneration:1,privateRevision:0,chatRequest:0,owners:{mine:true},voice:{phase:'recording',discard(){discards++;}},render(){renders++;},renderVoice(){},
+    lastSnapshot:null,threads:{},mutationKeys:new Map(),freshPost:(_old,next)=>next,setConnection(){},now:()=>0,
+    invalidateUnavailableChat(){},outbox:{retain(){}},saveSession(){},renderUpdates(){},renderInbox(){},
+    blockUI:{refreshIfOpen(){}},pollUpdates(){},refreshChat(){},updateDetail(){detailUpdates++;},detailError(){},
+  });
+  vm.runInContext(appSource.slice(appSource.indexOf('function applyFeedRevision('),appSource.indexOf('function openDialog(')),context);
+  vm.runInContext(appSource.slice(appSource.indexOf('let detailRead='),appSource.indexOf('function detailError(')),context);
+  return {context,$,discards:()=>discards,renders:()=>renders,detailUpdates:()=>detailUpdates};
+}
+
+test('private feed revision invalidates public detail and refuses delayed pre-block snapshots across feed changes',()=>{
+  const f=privacyFixture();assert.equal(f.context.applyFeedRevision({feedRevision:2}),true);
+  assert.deepEqual(Array.from(f.context.state.posts,post=>post.id),['mine']);
+  assert.equal(f.$('#detail').open,false);assert.equal(f.$('#detail-content').cleared,true);assert.equal(f.discards(),1);
+  f.context.lastSnapshot=null; // Changing city must not reset the private revision floor.
+  f.context.receive({feedRevision:1,posts:[{id:'blocked'}],version:100,epoch:'e',scope:'new',now:0});
+  assert.deepEqual(Array.from(f.context.state.posts,post=>post.id),['mine']);
+  f.context.receive({posts:[{id:'old anonymous response'}],version:100,epoch:'e',scope:'new',now:0});
+  assert.deepEqual(Array.from(f.context.state.posts,post=>post.id),['mine']);
+  f.context.receive({feedRevision:2,posts:[{id:'allowed'}],ownedPostIds:['mine'],ownedPosts:[{id:'mine'}],version:101,epoch:'e',scope:'new',now:0});
+  assert.deepEqual(Array.from(f.context.state.posts,post=>post.id),['allowed','mine']);
+});
+
+test('a detail read started before a block cannot restore its content afterwards',async()=>{
+  const f=privacyFixture();let resolve;f.context.api=()=>new Promise(done=>resolve=done);
+  const read=f.context.refreshDetail();f.context.applyFeedRevision({feedRevision:1});
+  // The same detail ID could be selected again after navigation; privacy must still win.
+  f.context.state.detailId='other';f.$('#detail').open=true;
+  resolve({post:{id:'other'},feedRevision:0});await read;
+  assert.equal(f.detailUpdates(),0);assert.equal(f.context.state.detailPost,null);
+});

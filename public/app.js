@@ -5,6 +5,7 @@ import { MessageOutbox, requestJSON as api } from './requests.js';
 import { createAccountUI } from './accounts.js';
 import { makeFeedShare, parseFeedLink } from './sharing.js';
 import { VoiceComposer, uploadVoice } from './voice.js';
+import { createBlockUI } from './blocks.js';
 
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -47,9 +48,9 @@ const accounts = createAccountUI({openDialog,onError:errorText,onChange:async se
   $('#moderation-button').hidden=!session.moderator;
   if(state.production) {
     if(changed) {
-      accountGeneration++; for(const id of Object.keys(threads)) delete threads[id];
+      accountGeneration++;state.feedRevision=0;blockUI.reset();$('#blocks').close();$('#block-author').close(); for(const id of Object.keys(threads)) delete threads[id];
       voice.discard();stopAudio($('#chat'),true);stopAudio($('#moderation'),true);
-      outbox.retain(new Set());writeIntents.clear();mutationKeys.clear();state.chat=null;
+      outbox.retain(new Set());writeIntents.clear();mutationKeys.clear();state.chat=null;state.chatPrivacyPending=false;
       state.mine=false;state.posts=[];state.readMarkers=state.user?readSession(`thesocialextra-read:${state.user.id}`):{};
       $('#chat').close();$('#inbox').close();
       $('#chat-messages').replaceChildren();$('#chat-input').value='';$('#inbox-list').replaceChildren();
@@ -62,19 +63,21 @@ const accounts = createAccountUI({openDialog,onError:errorText,onChange:async se
     $('#privacy-link').hidden=false;
     $('#inbox .sheet-subtitle').textContent='Vos conversations restent accessibles 7 jours après l’expiration de l’annonce.';
     $('#post-form .fine-print').textContent='Gratuit · Conditions et paiement à convenir entre vous. L’annonce quitte le fil à expiration.';
-    $('#help .help-copy').innerHTML='<p><strong>Vous êtes dispo ?</strong><br>Choisissez votre métier, une ville et une durée. Votre point apparaît en vert.</p><p><strong>Il manque quelqu’un ?</strong><br>Publiez votre besoin. Parlez-vous, puis confirmez chaque place vous-même. Un message ne réserve rien.</p><p><strong>Le fil reste frais.</strong><br>Les annonces pourvues quittent le fil public. Vous pouvez rouvrir une place jusqu’à l’expiration initiale. Les conversations privées restent disponibles sept jours après cette expiration, sauf suppression ou modération.</p><p><strong>Vous gardez la main.</strong><br>La localisation est approximative, à votre demande. Signalez un contenu ou bloquez un interlocuteur depuis l’échange. Les réponses sont actualisées quand l’application est visible ; pas de notification quand elle est fermée.</p><p><strong>Gratuit des deux côtés.</strong><br>Ni paiement ni contrat ne sont gérés ici. Les identités, compétences et autorisations de travail ne sont pas vérifiées. Convenez des conditions et effectuez les vérifications nécessaires avant toute mission.</p><p><a href="/privacy.html">Confidentialité et règles d’utilisation</a></p>';
+    $('#help .help-copy').innerHTML='<p><strong>Vous êtes dispo ?</strong><br>Choisissez votre métier, une ville et une durée. Votre point apparaît en vert.</p><p><strong>Il manque quelqu’un ?</strong><br>Publiez votre besoin. Parlez-vous, puis confirmez chaque place vous-même. Un message ne réserve rien.</p><p><strong>Le fil reste frais.</strong><br>Les annonces pourvues quittent le fil public. Vous pouvez rouvrir une place jusqu’à l’expiration initiale. Les conversations privées restent disponibles sept jours après cette expiration, sauf suppression ou modération.</p><p><strong>Vous gardez la main.</strong><br>La localisation est approximative, à votre demande. Signalez un contenu ou bloquez un compte depuis une annonce ou un échange. Gérez vos blocages dans Mon compte. Les réponses sont actualisées quand l’application est visible ; pas de notification quand elle est fermée.</p><p><strong>Gratuit des deux côtés.</strong><br>Ni paiement ni contrat ne sont gérés ici. Les identités, compétences et autorisations de travail ne sont pas vérifiées. Convenez des conditions et effectuez les vérifications nécessaires avant toute mission.</p><p><a href="/privacy.html">Confidentialité et règles d’utilisation</a></p>';
   }
   renderVoice();
   if(liveReady) { void changeFeed();void pollUpdates(); }
 }});
 $('#account-button').addEventListener('click',()=>accounts.show());
+const blockUI=createBlockUI({$,api,requireAccount:next=>accounts.require(next),getGeneration:()=>accountGeneration,openDialog,errorText,toast,onRevision:applyFeedRevision,refreshFeed:async()=>{await changeFeed();void pollUpdates();void refreshChat();}});
 let composerGeneration = 0, publishing = false;
 const now = () => Date.now() + state.offset;
 let toastTimer, chatTimer;
 let updatesRequest, updatesCursor = 0, updatesError = false, updatesCheckedAt = 0;
 function toast(message) { clearTimeout(toastTimer); $('#toast').textContent = message; $('#toast').hidden = false; toastTimer = setTimeout(() => $('#toast').hidden = true, 4500); }
 function errorText(error) {
-
+  if(error.code==='block_capacity_reached')return 'Votre liste de comptes bloqués a atteint sa capacité. Vos blocages existants restent actifs.';
+  if(error.code==='total_block_capacity_reached')return 'Le service de blocage a atteint sa capacité. Vos blocages existants restent actifs. Réessayez plus tard.';
   const voiceErrors={microphone_denied:'Le micro n’a pas été autorisé. Vous pouvez toujours écrire.',recording_unavailable:'Le micro est indisponible. Vérifiez les permissions ou écrivez votre message.',recording_failed:'L’enregistrement a été interrompu. Réessayez ou utilisez le texte.',recording_empty:'Aucun son enregistré. Réessayez ou utilisez le texte.',recording_interrupted:'Enregistrement effacé lorsque l’application a été masquée.',audio_busy:'Un vocal est en cours de traitement. Attendez un instant puis réessayez.',audio_too_large:'Ce vocal est trop volumineux. Enregistrez un message plus court.',audio_too_long:'Le vocal dépasse une minute. Enregistrez un message plus court.',invalid_audio:'Ce vocal ne peut pas être lu. Effacez-le puis réessayez.',unsupported_audio_type:'Ce format audio n’est pas accepté. Utilisez un autre navigateur ou le texte.',audio_processing_unavailable:'Le service vocal est indisponible. Votre enregistrement reste ici ; vous pouvez aussi écrire.',audio_processing_timeout:'Le traitement a pris trop de temps. Réessayez le même enregistrement.',voice_thread_capacity_reached:'La limite de 20 vocaux de cet échange est atteinte. Le texte reste disponible.',voice_user_capacity_reached:'Votre espace vocal est plein. Le texte reste disponible.',voice_total_capacity_reached:'Le service vocal a atteint sa capacité. Le texte reste disponible.',report_voice_capacity_reached:'Le stockage des preuves vocales est plein. Aucun signalement enregistré ; bloquez l’interlocuteur si nécessaire et réessayez plus tard.'};
   if(voiceErrors[error.code])return voiceErrors[error.code];
   if (error.code === 'request_timeout') return 'Le serveur ne répond pas. Résultat non confirmé ; votre saisie est conservée.';
@@ -128,7 +131,26 @@ function renderSelection() {
   $('#map-selection').innerHTML = `<button class="icon-button selection-close" aria-label="Fermer l’aperçu" data-clear-selection>${icon('x')}</button><span class="state-label ${post.status === 'full' ? 'full' : post.kind === 'need' ? 'need' : ''}"><span class="status-dot"></span>${statusLabel(post)}</span><h3>${esc(title(post))}</h3><p>${esc(post.zoneLabel)} · ${relative(post.updatedAt)}</p><div class="selection-tags">${tags(post)}</div><div class="selection-bottom"><span class="row-age">${post.demo ? 'Exemple fictif' : `Expire à ${time(post.expiresAt, post.timezone)}`}</span><button class="button lime" data-detail="${esc(post.id)}">Voir l’annonce${icon('arrow-up-right')}</button></div>`;
 }
 function setConnection(connected) { state.connected = connected; $('#connection').classList.toggle('offline', !connected); $('#connection').innerHTML = `<span class="status-dot"></span><span>${connected ? 'En direct' : 'Reconnexion…'}</span>`; }
+function applyFeedRevision(data) {
+  if(!state.production||!state.user)return true;
+  const revision=Number.isSafeInteger(data.feedRevision)?data.feedRevision:0;
+  if(revision<(state.feedRevision||0))return false;
+  if(revision>(state.feedRevision||0)) {
+    state.feedRevision=revision;++privateRevision;++chatRequest;state.chatPrivacyPending=Boolean(state.chat);
+    if(['requesting','recording','finishing'].includes(voice.phase))voice.discard();else renderVoice();
+    state.posts=state.posts.filter(post=>owners[post.id]);state.selected=null;
+    if(state.detailId&&!owners[state.detailId]) {state.detailId=null;state.detailPost=null;$('#detail').close();$('#detail-content').replaceChildren();}
+    if(state.chat){$('#chat-input').disabled=true;$('#chat-form button').disabled=true;$('#chat-block-status').textContent='Vérification du blocage…';}
+    render();
+  }
+  return true;
+}
 function receive(data) {
+  const priorRevision=state.feedRevision||0;
+  if(state.production&&state.user&&(data.feedRevision||priorRevision)) {
+    if(!applyFeedRevision(data))return;
+    if((state.feedRevision||0)>priorRevision) {blockUI.refreshIfOpen();void pollUpdates();void refreshChat();}
+  }
   if(state.production && lastSnapshot?.epoch===data.epoch && lastSnapshot?.scope===data.scope && lastSnapshot.version>data.version) return;
   lastSnapshot={epoch:data.epoch,scope:data.scope,version:data.version};
   if(state.production && !state.mine) {
@@ -255,14 +277,15 @@ function updateDetail(post) {
 let detailRead=null;
 function refreshDetail() {
   if(detailRead)return detailRead;
-  const id=state.detailId,generation=accountGeneration;
+  const id=state.detailId,generation=accountGeneration,privacy=state.feedRevision||0;
   detailRead=(async()=>{
     try {
-      const {post}=await api(`/api/posts/${id}`);
-      if(generation!==accountGeneration||id!==state.detailId||!$('#detail').open)return;
+      const data=await api(`/api/posts/${id}`),{post}=data;
+      if(generation!==accountGeneration||privacy!==(state.feedRevision||0)||id!==state.detailId||!$('#detail').open)return;
+      if(!applyFeedRevision(data)||id!==state.detailId)return;
       state.detailPost=post;state.detailUnavailable=false;updateDetail(post);
     }catch(error){
-      if(generation!==accountGeneration||id!==state.detailId||!$('#detail').open)return;
+      if(generation!==accountGeneration||privacy!==(state.feedRevision||0)||id!==state.detailId||!$('#detail').open)return;
       if(error.status===404||error.status===410) {state.detailUnavailable=true;updateDetail(state.detailPost);}
       else detailError(id,error);
     }finally{detailRead=null;}
@@ -288,7 +311,7 @@ function openDetail(id) {
   const post = state.posts.find(p => p.id === id && p.expiresAt > now()); if (!post) { toast('Cette annonce a expiré.'); return; }
   state.detailId = id;state.detailPost=post;state.detailUnavailable=false; const own = Boolean(owners[id]);
   $('#detail-content').innerHTML = `<div class="detail-role">${icon(roleIcon(post.role))}</div><div class="detail-state" aria-live="polite"><span id="detail-status" class="state-label"><span class="status-dot"></span><span id="detail-status-text"></span></span></div><h2 id="detail-title">${esc(title(post))}.</h2><p class="sheet-subtitle">${esc(post.zoneLabel)} · ${post.demo ? 'Exemple fictif' : own ? 'Votre annonce' : state.production ? 'Annonce locale' : 'Essai local'}</p><div class="detail-facts"><div>${icon('clock')}<span id="detail-expiration"></span></div>${post.english ? `<div>${icon('languages')}${post.kind === 'need' ? 'Anglais demandé' : 'Parle anglais'}</div>` : ''}${post.vehicle ? `<div>${icon('car')}${post.kind === 'need' ? 'Véhicule demandé' : 'Véhiculé'}</div>` : ''}${post.kind === 'need' ? `<div>${icon('briefcase-business')}<strong id="detail-places" aria-live="polite"></strong></div>` : ''}${post.pay ? `<div>${icon('check')}${esc(post.pay)} €/h annoncé · à confirmer ensemble</div>` : ''}</div>${post.note ? `<p class="detail-note">${esc(post.note)}</p>` : ''}<p id="detail-closed" class="detail-disclaimer" role="status" hidden></p>
-  ${post.demo ? `<p class="detail-disclaimer">Cette annonce illustre le service. Aucune personne réelle n’est derrière cet exemple. Publiez un essai et ouvrez-le dans une autre fenêtre pour tester le contact.</p><button class="button lime" data-try>Créer mon essai${icon('plus')}</button>` : own ? `<div class="detail-actions">${post.kind === 'need' ? `<button class="button lime" data-mutate="fill">Une place confirmée${icon('check')}</button>` : ''}<button class="button outline" data-mutate="close">${post.kind === 'need' ? 'Tout est pourvu' : 'Je ne suis plus dispo'}</button><button class="button lime" data-mutate="reopen">${post.kind === 'need' ? 'Rouvrir une place' : 'Je suis de nouveau dispo'}${icon('plus')}</button><button class="button outline" data-owner-inbox>Voir les réponses${icon('message-circle')}</button></div><p class="detail-disclaimer">${post.kind === 'need' ? 'Confirmez une place seulement après accord avec la personne. Un message ne réserve rien.' : 'Votre disponibilité expire automatiquement.'}</p>` : `<form id="contact-form" class="contact-form"><label class="field-label" for="contact-message">Votre premier message</label><p class="quick-reply-help">Un clic préremplit le message. À vous de l’envoyer.</p><div class="quick-replies" role="group" aria-label="Suggestions de premier message">${(post.kind === 'need' ? ['Bonjour, votre besoin est-il toujours d’actualité ?', 'Bonjour, quels sont les horaires ?'] : ['Bonjour, êtes-vous toujours disponible ?', 'Bonjour, pour quels horaires êtes-vous disponible ?']).map(text => `<button type="button" data-suggestion="${esc(text)}">${esc(text)}</button>`).join('')}</div><textarea id="contact-message" maxlength="500" required placeholder="Bonjour, toujours disponible ?"></textarea><button class="button lime" type="submit">Contacter directement${icon('send')}</button><p class="detail-disclaimer">${state.production?'Échange privé. Convenez des horaires et conditions ensemble.':'Échange dans ce prototype, sans coordonnées personnelles.'} Une réponse ne réserve aucune place.</p></form>`}${state.production?`<div class="safety-actions">${own?'<button class="text-button" data-delete-post>Supprimer l’annonce</button>':'<button class="text-button" data-report-post>Signaler cette annonce</button>'}</div>`:''}<p id="detail-error" class="form-error" role="alert" hidden></p><button class="text-button" data-share>${icon('share-2')}Copier le lien de cette annonce</button><p class="fine-print">${state.production?'Lien partageable · L’annonce disparaît à expiration.':'Lien de test local · Ne fonctionne pas sur un autre appareil.'}</p>`;
+  ${post.demo ? `<p class="detail-disclaimer">Cette annonce illustre le service. Aucune personne réelle n’est derrière cet exemple. Publiez un essai et ouvrez-le dans une autre fenêtre pour tester le contact.</p><button class="button lime" data-try>Créer mon essai${icon('plus')}</button>` : own ? `<div class="detail-actions">${post.kind === 'need' ? `<button class="button lime" data-mutate="fill">Une place confirmée${icon('check')}</button>` : ''}<button class="button outline" data-mutate="close">${post.kind === 'need' ? 'Tout est pourvu' : 'Je ne suis plus dispo'}</button><button class="button lime" data-mutate="reopen">${post.kind === 'need' ? 'Rouvrir une place' : 'Je suis de nouveau dispo'}${icon('plus')}</button><button class="button outline" data-owner-inbox>Voir les réponses${icon('message-circle')}</button></div><p class="detail-disclaimer">${post.kind === 'need' ? 'Confirmez une place seulement après accord avec la personne. Un message ne réserve rien.' : 'Votre disponibilité expire automatiquement.'}</p>` : `<form id="contact-form" class="contact-form"><label class="field-label" for="contact-message">Votre premier message</label><p class="quick-reply-help">Un clic préremplit le message. À vous de l’envoyer.</p><div class="quick-replies" role="group" aria-label="Suggestions de premier message">${(post.kind === 'need' ? ['Bonjour, votre besoin est-il toujours d’actualité ?', 'Bonjour, quels sont les horaires ?'] : ['Bonjour, êtes-vous toujours disponible ?', 'Bonjour, pour quels horaires êtes-vous disponible ?']).map(text => `<button type="button" data-suggestion="${esc(text)}">${esc(text)}</button>`).join('')}</div><textarea id="contact-message" maxlength="500" required placeholder="Bonjour, toujours disponible ?"></textarea><button class="button lime" type="submit">Contacter directement${icon('send')}</button><p class="detail-disclaimer">${state.production?'Échange privé. Convenez des horaires et conditions ensemble.':'Échange dans ce prototype, sans coordonnées personnelles.'} Une réponse ne réserve aucune place.</p></form>`}${state.production?`<div class="safety-actions">${own?'<button class="text-button" data-delete-post>Supprimer l’annonce</button>':'<button class="text-button" data-report-post>Signaler cette annonce</button><button class="text-button" data-block-author>Bloquer ce compte</button>'}</div>`:''}<p id="detail-error" class="form-error" role="alert" hidden></p><button class="text-button" data-share>${icon('share-2')}Copier le lien de cette annonce</button><p class="fine-print">${state.production?'Lien partageable · L’annonce disparaît à expiration.':'Lien de test local · Ne fonctionne pas sur un autre appareil.'}</p>`;
   updateDetail(post); openDialog($('#detail'));
   const form = $('#contact-form'); if (form) form.addEventListener('submit', async e => {
     e.preventDefault(); const button = form.querySelector('button[type="submit"]'); if (button.disabled) return;
@@ -312,6 +335,7 @@ function openDetail(id) {
   });
 }
 $('#detail-content').addEventListener('click', async e => {
+  if(e.target.closest('[data-block-author]'))return blockUI.showAuthor(state.detailId);
   if(e.target.closest('[data-report-post]'))return openReport('post',state.detailId);
   if(e.target.closest('[data-delete-post]')) {deletePostId=state.detailId;$('#delete-post-error').hidden=true;openDialog($('#delete-post'));return;}
   const suggestion = e.target.closest('[data-suggestion]');
@@ -367,8 +391,8 @@ $('#report-form').addEventListener('submit',async event=>{
   finally{button.disabled=false;}
 });
 $('#chat-block').addEventListener('click',async()=>{
-  const id=state.chat;if(!id||!threads[id])return;const button=$('#chat-block');button.disabled=true;
-  try {await api(`/api/threads/${id}/block`,{method:'POST',body:{blocked:!threads[id].blockedByMe}});await refreshChat();}
+  const id=state.chat,generation=accountGeneration;if(!id||!threads[id])return;const button=$('#chat-block');button.disabled=true;
+  try {const data=await api(`/api/threads/${id}/block`,{method:'POST',body:{blocked:!threads[id].blockedByMe}});if(generation!==accountGeneration)return;applyFeedRevision(data);await changeFeed();void pollUpdates();await refreshChat();}
   catch(error){if(state.chat===id){$('#chat-error').textContent=errorText(error);$('#chat-error').hidden=false;}}
   finally{button.disabled=false;}
 });
@@ -495,12 +519,12 @@ function reportVoiceMarkup(report) {
   }catch{return '';}
 }
 function renderVoice() {
-  const panel=$('#voice-composer'),snapshot=voice.snapshot(),blocked=Boolean(threads[state.chat]?.blocked);
+  const panel=$('#voice-composer'),snapshot=voice.snapshot(),blocked=Boolean(threads[state.chat]?.blocked)||Boolean(state.chatPrivacyPending);
   panel.hidden=!state.production||!state.voiceEnabled||!state.chat||!threads[state.chat];
   const playable=Boolean($('#voice-preview').canPlayType?.('audio/ogg; codecs=opus'));
   $('#voice-record').hidden=snapshot.phase!=='idle'||!snapshot.supported||!playable;
   $('#voice-record').disabled=blocked;
-  $('#voice-help').textContent=blocked?'Cet échange est bloqué.':!snapshot.supported||!playable?'Les vocaux ne sont pas disponibles dans ce navigateur. Le texte reste disponible.':'1 minute maximum. Vous écoutez, puis vous choisissez d’envoyer.';
+  $('#voice-help').textContent=state.chatPrivacyPending?'Vérification du blocage…':blocked?'Cet échange est bloqué.':!snapshot.supported||!playable?'Les vocaux ne sont pas disponibles dans ce navigateur. Le texte reste disponible.':'1 minute maximum. Vous écoutez, puis vous choisissez d’envoyer.';
   $('#voice-active').hidden=snapshot.phase==='idle';
   const labels={requesting:'Autorisez le micro pour enregistrer.',recording:`Enregistrement · 0:${String(snapshot.seconds).padStart(2,'0')} / 1:00`,finishing:'Préparation de votre écoute…',ready:'Votre vocal est prêt. Rien n’est encore envoyé.',sending:'Envoi et vérification du vocal…'};
   $('#voice-status').textContent=snapshot.error&&snapshot.phase==='ready'?'Envoi non confirmé. Réessayez ce même vocal ou effacez le brouillon.':labels[snapshot.phase]||'';
@@ -538,11 +562,11 @@ function renderChatMessages(thread,id) {
   // Stable nodes keep their playback position when a new text reply arrives.
   if(changed&&beforeBottom)$('#chat-form').scrollIntoView({block:'end'});
 }
-$('#voice-record').addEventListener('click',()=>{if(state.voiceEnabled&&state.chat&&threads[state.chat]&&!threads[state.chat].blocked)void voice.start();});
+$('#voice-record').addEventListener('click',()=>{if(state.voiceEnabled&&state.chat&&threads[state.chat]&&!threads[state.chat].blocked&&!state.chatPrivacyPending)void voice.start();});
 $('#voice-stop').addEventListener('click',()=>voice.stop());
 $('#voice-discard').addEventListener('click',()=>voice.discard());
 $('#voice-send').addEventListener('click',async()=>{
-  const id=state.chat,generation=accountGeneration;if(!id||!threads[id]||threads[id].blocked||!state.voiceEnabled)return;
+  const id=state.chat,generation=accountGeneration;if(!id||!threads[id]||threads[id].blocked||state.chatPrivacyPending||!state.voiceEnabled)return;
   const intent=voice.beginSend();if(!intent)return;
   try {await uploadVoice(id,intent);if(voice.finishSend(intent)&&state.chat===id&&generation===accountGeneration){toast('Vocal envoyé.');void refreshChat();}}
   catch(error){voice.finishSend(intent,error);}
@@ -560,7 +584,7 @@ function refreshChat() {
     if (state.chat !== id || request !== chatRequest || !threads[id] || !$('#chat').open || document.hidden) return;
     renderChatMessages(thread,id);
     threads[id] = markRead(threads[id], { incomingCount: thread.incomingCount, messageCount: thread.messages.length, updatedAt: thread.updatedAt });
-    threads[id].blocked=thread.blocked;threads[id].blockedByMe=thread.blockedByMe;
+    threads[id].blocked=thread.blocked;threads[id].blockedByMe=thread.blockedByMe;state.chatPrivacyPending=false;
     if(thread.blocked&&voice.phase!=='idle')voice.discard();renderVoice();
     $('#chat-input').disabled=Boolean(thread.blocked);
     $('#chat-form button').disabled=Boolean(thread.blocked)||outbox.get(id).busy;
@@ -586,23 +610,23 @@ async function openChat(id) {
   if (!threads[id]) return;
   clearInterval(chatTimer);
   voice.discard();stopAudio($('#chat'),true);
-  openDialog($('#chat')); state.chat = id; ++chatRequest;
+  openDialog($('#chat')); state.chat = id;state.chatPrivacyPending=Boolean(state.production); ++chatRequest;
   $('#chat-title').textContent = 'En direct, à deux.';
   $('#chat-subtitle').textContent = `${threads[id].role} · ${threads[id].zoneLabel} · ${state.production?`privé jusqu’au ${dateTime(threads[id].expiresAt,threads[id].timezone)}`:'échange local'}`;
-  $('#chat-safety').hidden=!state.production;$('#chat-block-status').textContent='';$('#chat-input').disabled=false;
+  $('#chat-safety').hidden=!state.production;$('#chat-block-status').textContent=state.chatPrivacyPending?'Vérification du blocage…':'';$('#chat-input').disabled=state.chatPrivacyPending;
   $('#chat-messages').innerHTML = '<p class="loading-copy">Ouverture de la conversation…</p>';
   const entry = outbox.get(id);
   $('#chat-error').hidden = !entry.error;
   if (entry.error) $('#chat-error').textContent = errorText(entry.error);
   $('#chat-form').hidden = false; $('#chat-input').value = entry.draft;
-  $('#chat-form button').disabled = entry.busy;
+  $('#chat-form button').disabled = entry.busy||state.chatPrivacyPending;
   renderVoice();
   await refreshChat(); if (state.chat === id && $('#chat').open) chatTimer = setInterval(refreshChat, 1800);
 }
 $('#chat-input').addEventListener('input', () => { if (state.chat) outbox.edit(state.chat, $('#chat-input').value); });
 $('#chat-form').addEventListener('submit', async e => {
   e.preventDefault(); const id = state.chat, token = threads[id]?.token;
-  if (!id || (!state.production&&!token) || threads[id]?.blocked) return;
+  if (!id || (!state.production&&!token) || threads[id]?.blocked || state.chatPrivacyPending) return;
   outbox.edit(id, $('#chat-input').value);
   const intent = outbox.begin(id); if (!intent) return;
   $('#chat-form button').disabled = true; $('#chat-error').hidden = true;
@@ -617,7 +641,7 @@ $('#chat-form').addEventListener('submit', async e => {
     outbox.finish(id, intent, error);
     if (state.chat === id && $('#chat').open) { $('#chat-error').textContent = errorText(error); $('#chat-error').hidden = false; }
   } finally {
-    if (state.chat === id && $('#chat').open) $('#chat-form button').disabled = !threads[id] || threads[id]?.blocked || outbox.get(id).busy;
+    if (state.chat === id && $('#chat').open) $('#chat-form button').disabled = !threads[id] || threads[id]?.blocked || state.chatPrivacyPending || outbox.get(id).busy;
   }
 });
 
@@ -680,9 +704,9 @@ async function start() {
     const shared = parseFeedLink(deletionLink ? new URL('/', location.href).href : location.href, state.roles), requested = shared.postId;
     function linkNotice(message) { $('#feed-link-notice').textContent = message; $('#feed-link-notice').hidden = false; }
     if (shared.invalid) linkNotice('Certains filtres de ce lien sont invalides et ont été ignorés.');
-    let linkedPost;
+    let linkedPost,linkedGeneration=accountGeneration,linkedRevision=state.feedRevision||0;
     if (requested && state.production) {
-      try { linkedPost = (await api(`/api/posts/${requested}`)).post; }
+      try { const data=await api(`/api/posts/${requested}`);if(linkedGeneration===accountGeneration&&applyFeedRevision(data)){linkedPost=data.post;linkedRevision=state.feedRevision||0;} }
       catch { linkNotice('Cette annonce a expiré ou n’existe plus. Voici le fil actuel.'); }
     } else if (shared.scope) {
       try {
@@ -702,7 +726,7 @@ async function start() {
       if (generation !== accountGeneration) continue;
       receive(initial); break;
     }
-    if (linkedPost && !state.posts.some(post => post.id === linkedPost.id)) state.posts.push(linkedPost);
+    if (linkedPost && linkedGeneration===accountGeneration && linkedRevision===(state.feedRevision||0) && !state.posts.some(post => post.id === linkedPost.id)) state.posts.push(linkedPost);
     if (requested) {
       const post = state.posts.find(post => post.id === requested);
       if (post) { if (!state.production) setCity(cityOfPost(post)); selectPost(requested); openDetail(requested); }
