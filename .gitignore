@@ -1,0 +1,12 @@
+node_modules/
+.runtime/
+.env
+.env.*
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+*.key
+*.pem
+*.tseb
+.DS_Store

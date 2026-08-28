@@ -1,0 +1,7 @@
+<!-- App-owned geometry derived from assets/favicon.svg; no third-party image.
+     PNG companions are locally rasterized from this geometry with Pillow.
+     Full-bleed background; central mark lies inside the maskable safe circle. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#c4f35b"/>
+  <circle cx="256" cy="256" r="96" fill="#203128"/>
+</svg>

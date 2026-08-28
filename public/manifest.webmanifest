@@ -1,0 +1,18 @@
+{
+  "id": "/",
+  "name": "thesocialextra",
+  "short_name": "thesocialextra",
+  "description": "Un renfort ou une mission autour de vous. Gratuit, en contact direct. Connexion nécessaire.",
+  "lang": "fr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#fafbf7",
+  "theme_color": "#fafbf7",
+  "icons": [
+    { "src": "/assets/pwa-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/assets/pwa-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/assets/pwa-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "prefer_related_applications": false
+}
