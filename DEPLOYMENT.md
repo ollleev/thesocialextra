@@ -57,3 +57,7 @@ Le micro n’est demandé qu’après un clic. Aucun enregistrement n’est envo
 La page `/delete-account.html` propose un chemin vers le formulaire de compte sans installation mobile. Un lien ne supprime jamais le compte : connexion ou récupération, phrase secrète et confirmation restent nécessaires. La politique de sauvegarde doit expliquer les limites de cet effacement.
 
 Le modèle de job quotidien et ses limites sont détaillés dans [BACKUP.md](BACKUP.md). Il vérifie une restauration avant de publier un point chiffré et refuse une capacité insuffisante avant la copie, journal WAL compris. Ne pas confondre un timer local avec un transfert hors machine ou un dispositif d’alerte.
+
+## Règles versionnées
+
+Le document courant est identifié dans `rules.mjs` et servi depuis les octets dont le SHA256 a été vérifié au démarrage. Ne modifiez jamais le texte d’une version déjà publiée : ajoutez un nouveau fichier et une nouvelle version avec sa nouvelle empreinte. Le catalogue SQLite refuse de réutiliser une version avec un autre contenu. L’accord est requis pour publier, rouvrir ou envoyer ; un ancien compte conserve lecture, sécurité et suppression sans accord rétroactif. Le document initial décrit un pilote, pas des conditions légales finalisées.

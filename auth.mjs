@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { ApiError } from './domain.mjs';
+import { RULES } from './rules.mjs';
 
 // OWASP's scrypt fallback when Argon2id is unavailable. Production callers must
 // not override this work factor. The KDF runs asynchronously in native workers.
@@ -40,11 +41,18 @@ export class AuthService {
   #clock;
   #kdf;
   #maxUsers;
-  constructor({ db, clock = Date.now, testKdf, maxUsers = 10000 } = {}) {
+  #rules;
+  constructor({ db, clock = Date.now, testKdf, testRules, maxUsers = 10000 } = {}) {
     if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') throw new TypeError('DatabaseSync required');
     if (typeof clock !== 'function') throw new TypeError('clock must be a function');
     if (!Number.isSafeInteger(maxUsers) || maxUsers < 1) throw new TypeError('maxUsers must be a positive safe integer');
     if (testKdf !== undefined && (!process.env.NODE_TEST_CONTEXT || typeof testKdf !== 'function')) throw new TypeError('KDF injection is only available to the native test runner');
+    if (testRules !== undefined && (!process.env.NODE_TEST_CONTEXT || !testRules || !/^\d{4}-\d{2}-\d{2}\.\d{1,4}$/.test(testRules.version) ||
+      typeof testRules.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(testRules.sha256) || testRules.url !== `/rules/${testRules.version}.html`)) {
+      throw new TypeError('Alternate rules are only available to the native test runner');
+    }
+    const rules = testRules ?? RULES;
+    this.#rules = Object.freeze({ version: rules.version, sha256: rules.sha256, url: rules.url });
     this.#db = db; this.#clock = clock; this.#kdf = testKdf ?? nativeKdf; this.#maxUsers = maxUsers;
     db.exec(`
       CREATE TABLE IF NOT EXISTS auth_users (
@@ -64,7 +72,27 @@ export class AuthService {
       ) STRICT;
       CREATE INDEX IF NOT EXISTS auth_sessions_user ON auth_sessions(user_id, created_at);
       CREATE INDEX IF NOT EXISTS auth_sessions_expiry ON auth_sessions(expires_at);
+      CREATE TABLE IF NOT EXISTS auth_rule_versions (
+        version TEXT PRIMARY KEY,
+        content_sha256 TEXT NOT NULL,
+        url TEXT NOT NULL,
+        UNIQUE(version, content_sha256)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS auth_rule_acceptances (
+        user_id TEXT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+        version TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        accepted_at INTEGER NOT NULL,
+        PRIMARY KEY(user_id, version),
+        FOREIGN KEY(version, content_sha256) REFERENCES auth_rule_versions(version, content_sha256)
+      ) STRICT;
     `);
+    this.#transaction(() => {
+      this.#db.prepare('INSERT OR IGNORE INTO auth_rule_versions(version,content_sha256,url) VALUES(?,?,?)')
+        .run(this.#rules.version,this.#rules.sha256,this.#rules.url);
+      const recorded=this.#db.prepare('SELECT content_sha256,url FROM auth_rule_versions WHERE version=?').get(this.#rules.version);
+      if(recorded.content_sha256!==this.#rules.sha256 || recorded.url!==this.#rules.url) throw new Error('rules_version_content_conflict');
+    });
   }
   #transaction(operation) {
     // Savepoints also compose with a caller's synchronous business transaction.
@@ -103,8 +131,9 @@ export class AuthService {
     return sessionToken;
   }
   async register(input) {
-    fields(input, ['username', 'password']);
+    fields(input, ['username', 'password', 'acceptedRules', 'rulesVersion']);
     const name = username(input.username), cleartext = password(input.password);
+    this.#validateAcceptance(input);
     if (this.#db.prepare('SELECT id FROM auth_users WHERE username = ?').get(name)) fail(409, 'username_unavailable');
     // Accounts do not expire. This pilot guardrail neither removes users nor
     // prevents existing users from logging in or recovering their account.
@@ -113,11 +142,13 @@ export class AuthService {
     const user = { id: randomUUID(), username: name }, recoveryCode = secret();
     return this.#transaction(() => {
       // Recheck after the asynchronous KDF to handle competing registrations.
+      this.#validateAcceptance(input);
       if (this.#db.prepare('SELECT id FROM auth_users WHERE username = ?').get(name)) fail(409, 'username_unavailable');
       if (this.#db.prepare('SELECT COUNT(*) AS n FROM auth_users').get().n >= this.#maxUsers) fail(429, 'user_capacity_reached');
       this.#db.prepare(`INSERT INTO auth_users(id, username, password_kdf, password_salt, password_hash, recovery_hash, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)`).run(user.id, name, KDF_ID, salt.toString('hex'), key.toString('hex'), secretHash(recoveryCode), this.#clock());
-      return { user, sessionToken: this.#newSession(user.id), recoveryCode };
+      this.#recordAcceptance(user.id);
+      return { user, sessionToken: this.#newSession(user.id), recoveryCode, rules:this.rulesStatus(user.id) };
     });
   }
   async login(input) {
@@ -139,7 +170,7 @@ export class AuthService {
       const current = this.#db.prepare('SELECT id, username FROM auth_users WHERE id = ? AND password_hash = ? AND password_salt = ?')
         .get(user.id, user.password_hash, user.password_salt);
       if (!current) fail(401, 'invalid_credentials');
-      return { user: publicUser(current), sessionToken: this.#newSession(current.id) };
+      return { user: publicUser(current), sessionToken: this.#newSession(current.id), rules:this.rulesStatus(current.id) };
     });
   }
   session(sessionToken) {
@@ -167,13 +198,38 @@ export class AuthService {
         .run(salt.toString('hex'), key.toString('hex'), KDF_ID, secretHash(recoveryCode), user.id, oldRecoveryHash);
       if (Number(changed.changes) !== 1) fail(401, 'invalid_credentials');
       this.#db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(user.id);
-      return { user: publicUser(user), sessionToken: this.#newSession(user.id), recoveryCode };
+      return { user: publicUser(user), sessionToken: this.#newSession(user.id), recoveryCode, rules:this.rulesStatus(user.id) };
+    });
+  }
+  hasAcceptedRules(userId) {
+    if(typeof userId!=='string'||!userId)return false;
+    return Boolean(this.#db.prepare(`SELECT 1 FROM auth_rule_acceptances a JOIN auth_users u ON u.id=a.user_id
+      WHERE a.user_id=? AND a.version=? AND a.content_sha256=?`).get(userId,this.#rules.version,this.#rules.sha256));
+  }
+  rulesStatus(userId=null) { return {...this.#rules,accepted:this.hasAcceptedRules(userId)}; }
+  #validateAcceptance(input) {
+    if(input.acceptedRules!==true) fail(403,'rules_acceptance_required');
+    if(input.rulesVersion!==this.#rules.version) fail(409,'rules_version_changed');
+  }
+  #recordAcceptance(userId) {
+    this.#db.prepare('INSERT OR IGNORE INTO auth_rule_acceptances(user_id,version,content_sha256,accepted_at) VALUES(?,?,?,?)')
+      .run(userId,this.#rules.version,this.#rules.sha256,this.#clock());
+    if(!this.hasAcceptedRules(userId)) throw new Error('rules_acceptance_conflict');
+  }
+  acceptRules(userId,input) {
+    fields(input,['acceptedRules','rulesVersion']);
+    this.#validateAcceptance(input);
+    return this.#transaction(()=>{
+      if(typeof userId!=='string'||!this.#db.prepare('SELECT id FROM auth_users WHERE id=?').get(userId)) fail(401,'login_required');
+      this.#recordAcceptance(userId);
+      return {rules:this.rulesStatus(userId)};
     });
   }
   deleteAccount(userId) {
     if (typeof userId !== 'string' || !userId || userId.length > 128) fail(400, 'invalid_user');
     this.#transaction(() => {
       this.#db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(userId);
+      this.#db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id = ?').run(userId);
       this.#db.prepare('DELETE FROM auth_users WHERE id = ?').run(userId);
     });
   }

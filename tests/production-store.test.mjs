@@ -12,7 +12,8 @@ const error = (status,code) => e => e.status===status && e.code===code;
 function fixture(t, options={}) {
   const dir=mkdtempSync(path.join(tmpdir(),'thesocialextra-store-')), filename=path.join(dir,'app.sqlite');
   let now=1_800_000_000_000, db=openDatabase(filename);
-  const make=()=>new ProductionStore({db,clock:()=>now,moderators:['moderator'],...options});
+  // Business fixtures explicitly allow UGC; real HTTP tests use persisted account agreements.
+  const make=()=>new ProductionStore({db,clock:()=>now,moderators:['moderator'],hasAcceptedRules:()=>true,...options});
   let store=make();
   t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
   return {get db(){return db;},get store(){return store;},filename,dir,advance:ms=>now+=ms,reopen(){db.close();db=openDatabase(filename);store=make();return store;}};
@@ -195,7 +196,7 @@ test('legacy block migration preserves all pairs and timestamps, stable opaque h
   assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_blocks').get().n,3);
   assert.equal(f.db.prepare('PRAGMA table_info(app_blocks)').all().some(column=>column.name==='id'),false);
   assert.equal(f.db.prepare("SELECT name FROM sqlite_schema WHERE name='app_blocks_migrated'").get(),undefined);
-  const migrated=new ProductionStore({db:f.db,maxBlocksPerUser:1});
+  const migrated=new ProductionStore({db:f.db,maxBlocksPerUser:1,hasAcceptedRules:()=>true});
   const rows=f.db.prepare('SELECT blocker_id,blocked_id,created_at FROM app_blocks ORDER BY created_at').all();
   assert.deepEqual(rows.map(row=>[row.blocker_id,row.blocked_id,row.created_at]),[['reader','expired-author',123],['reader','removed-author',124],['other','reader',125]]);
   const handles=migrated.listBlocks('reader').blocks;
@@ -550,6 +551,53 @@ function voiceChat(f,{owner='owner',guest='guest',tag='voice'}={}) {
   const post=f.store.create(owner,input(),key(`${tag}-post`)).post;
   return {post,...f.store.contact(guest,post.id,{message:'Synthetic initial contact.'},key(`${tag}-contact`))};
 }
+
+test('a store without an explicit synchronous positive rules guard refuses UGC',t=>{
+  const {db}=fixture(t);
+  for(const hasAcceptedRules of [undefined,()=>false,()=>undefined,()=>1,()=>Promise.resolve(true)]) {
+    const store=new ProductionStore({db,hasAcceptedRules});
+    assert.throws(()=>store.create('owner',input(),key('unguarded-create')),error(403,'rules_acceptance_required'));
+    assert.equal(store.state().posts.length,0);
+  }
+});
+
+test('current rules guard precedes every UGC cache replay and final voice insertion without closing safety or reads',t=>{
+  let accepted=true;const f=fixture(t,{hasAcceptedRules:()=>accepted}),{store}=f;
+  const chat=voiceChat(f,{tag:'rules'}),payload=voicePayload(),source=voiceSource(payload);
+  const text={message:'Synthetic accepted message.'};
+  store.addMessage('owner',chat.threadId,text,key('rules-text'));
+  const voice=store.addVoiceMessage('owner',chat.threadId,payload,key('rules-voice'));
+  store.mutate('owner',chat.post.id,{action:'fill'},key('rules-fill'));
+  store.mutate('owner',chat.post.id,{action:'reopen'},key('rules-reopen'));
+  assert.equal(store.prepareVoice('owner',chat.threadId,source,key('rules-pending-voice')),null);
+  const messages=f.db.prepare('SELECT COUNT(*) n FROM app_messages').get().n;
+  const version=store.state().version;
+  accepted=false;
+  const attempts=[
+    ()=>store.create('owner',input(),key('rules-post')),
+    ()=>store.create('owner',input(),key('rules-new-post')),
+    ()=>store.mutate('owner',chat.post.id,{action:'reopen'},key('rules-reopen')),
+    ()=>store.contact('guest',chat.post.id,{message:'Synthetic initial contact.'},key('rules-contact')),
+    ()=>store.contact('other',chat.post.id,{message:'New contact.'},key('rules-new-contact')),
+    ()=>store.addMessage('owner',chat.threadId,text,key('rules-text')),
+    ()=>store.addMessage('owner',chat.threadId,text,key('rules-new-text')),
+    ()=>store.prepareVoice('owner',chat.threadId,source,key('rules-voice')),
+    ()=>store.addVoiceMessage('owner',chat.threadId,payload,key('rules-voice')),
+    ()=>store.addVoiceMessage('owner',chat.threadId,payload,key('rules-pending-voice')),
+  ];
+  for(const attempt of attempts)assert.throws(attempt,error(403,'rules_acceptance_required'));
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_messages').get().n,messages);
+  assert.equal(store.state().version,version);
+  assert.equal(store.readThread('guest',chat.threadId).thread.messages.length,messages);
+  assert.equal(store.getVoice('guest',voice.message.id).bytes.length,payload.bytes.length);
+  const report=store.report('guest',{targetType:'thread',targetId:chat.threadId,reason:'other'},key('rules-report'));
+  assert.ok(report.id);
+  const block=store.blockPost('guest',chat.post.id);store.unblock('guest',block.blockId);
+  store.block('owner',chat.threadId);store.block('owner',chat.threadId,false);
+  store.mutate('owner',chat.post.id,{action:'fill'},key('rules-unaccepted-fill'));
+  store.mutate('owner',chat.post.id,{action:'close'},key('rules-unaccepted-close'));
+  store.remove('owner',chat.post.id);assert.equal(store.state().posts.length,0);
+});
 
 test('voice metadata and private blobs survive reopening and backup without changing text messages or public state',async t=>{
   const f=fixture(t),chat=voiceChat(f),payload=voicePayload(),before=f.store.readThread('owner',chat.threadId).thread.messages[0];

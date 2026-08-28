@@ -20,7 +20,8 @@ export class ProductionStore {
     maxThreads = 10000, maxTotalMessages = 200000, maxTotalIntents = 250000, maxThreadsPerUser = 500,
     maxReports = 5000, maxReportEvidenceBytes = 16 * 1024, maxVoicesPerThread = 20,
     maxVoiceBytesPerUser = 20 * 1024 * 1024, maxTotalVoiceBytes = 200 * 1024 * 1024,
-    maxReportVoiceBytes = 50 * 1024 * 1024, maxBlocksPerUser = 500, maxTotalBlocks = 100000 } = {}) {
+    maxReportVoiceBytes = 50 * 1024 * 1024, maxBlocksPerUser = 500, maxTotalBlocks = 100000,
+    hasAcceptedRules = () => false } = {}) {
     // Pilot safety limits, not measured commercial capacity. All instances using
     // one database must be configured with the same limits.
     // Reports consume at most ~78 MiB of new evidence at these defaults, plus
@@ -32,7 +33,8 @@ export class ProductionStore {
     for (const [name, value] of Object.entries(limits)) {
       if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer`);
     }
-    this.db = db; this.clock = clock; this.moderators = new Set(moderators);
+    if(typeof hasAcceptedRules!=='function')throw new TypeError('hasAcceptedRules must be a function');
+    this.db = db; this.clock = clock; this.moderators = new Set(moderators); this.hasAcceptedRules=hasAcceptedRules;
     Object.assign(this, limits);
     this.listeners = new Set(); this.privateListeners = new Set(); this.privateChanged = new Set();
     this.transactionDepth = 0; this.publicChanged = false;
@@ -140,6 +142,7 @@ export class ProductionStore {
   }
   actor(userId) { if (typeof userId !== 'string' || !userId) fail(401, 'login_required'); }
   writer(userId) { this.actor(userId); if (this.db.prepare('SELECT id FROM app_suspended_users WHERE id=?').get(userId)) fail(403, 'account_suspended'); }
+  ugcWriter(userId) { this.writer(userId); if(this.hasAcceptedRules(userId)!==true)fail(403,'rules_acceptance_required'); }
   blocked(a, b) { return Boolean(this.db.prepare('SELECT 1 FROM app_blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)').get(a,b,b,a)); }
   blockedBy(userId, other) { return Boolean(this.db.prepare('SELECT 1 FROM app_blocks WHERE blocker_id=? AND blocked_id=?').get(userId,other)); }
   feedRevision(userId) { this.actor(userId); return this.db.prepare('SELECT revision FROM app_block_revisions WHERE user_id=?').get(userId)?.revision ?? 0; }
@@ -200,7 +203,7 @@ export class ProductionStore {
     return { post:publicPost(parse(row)), ...(userId?{feedRevision:this.feedRevision(userId)}:{}) };
   }
   create(userId,input,key) {
-    this.writer(userId); const data=validatePost(input); this.sweep();
+    this.ugcWriter(userId); const data=validatePost(input); this.sweep();
     return this.transaction(()=>{
       const result=this.intent(userId,'create',key,data,()=>{
       if (this.db.prepare('SELECT COUNT(*) AS n FROM app_posts').get().n>=this.maxPosts) fail(429,'post_capacity_reached');
@@ -218,6 +221,7 @@ export class ProductionStore {
   mutate(userId,id,input,key) {
     this.writer(userId); fields(input,['action']);
     if (!['fill','close','reopen'].includes(input.action)) fail(400,'invalid_action');
+    if(input.action==='reopen')this.ugcWriter(userId);
     return this.transaction(()=>{
       const row=this.livePost(id); if (row.owner_id!==userId) fail(403,'owner_required');
       this.intent(userId,`post:${id}`,key,input,()=>{
@@ -243,7 +247,7 @@ export class ProductionStore {
     });
   }
   contact(userId,id,input,key) {
-    this.writer(userId); fields(input,['message']); const message=text(input.message,500,true); this.sweep();
+    this.ugcWriter(userId); fields(input,['message']); const message=text(input.message,500,true); this.sweep();
     return this.transaction(()=>{
       const row=this.postRow(id);
       if(row.owner_id===userId) fail(409,'own_post_contact');
@@ -289,7 +293,7 @@ export class ProductionStore {
       blocked:this.blocked(row.owner_id,row.guest_id),blockedByMe:Boolean(this.db.prepare('SELECT 1 FROM app_blocks WHERE blocker_id=? AND blocked_id=?').get(userId,row.side==='owner'?row.guest_id:row.owner_id)),...incomingMessages({messages},row.side),messages}};
   }
   addMessage(userId,id,input,key) {
-    this.writer(userId); fields(input,['message']); const message=text(input.message,500,true); this.sweep();
+    this.ugcWriter(userId); fields(input,['message']); const message=text(input.message,500,true); this.sweep();
     return this.transaction(()=>{
       const row=this.threadAccess(userId,id);
       return this.intent(userId,`message:${id}`,key,{message},()=>{
@@ -312,7 +316,7 @@ export class ProductionStore {
     return {sourceHash:input.sourceHash,contentType:input.contentType};
   }
   voiceWriter(userId,id) {
-    this.writer(userId);
+    this.ugcWriter(userId);
     const thread=this.threadAccess(userId,id);
     if(this.blocked(thread.owner_id,thread.guest_id)) fail(403,'contact_blocked');
     return thread;
@@ -330,7 +334,7 @@ export class ProductionStore {
     if(this.db.prepare('SELECT COALESCE(SUM(length(bytes)),0) n FROM app_voices').get().n+additionalBytes>this.maxTotalVoiceBytes) fail(429,'voice_total_capacity_reached');
   }
   prepareVoice(userId,id,input,key) {
-    this.writer(userId); const source=this.voiceSource(input); this.sweep();
+    this.ugcWriter(userId); const source=this.voiceSource(input); this.sweep();
     return this.transaction(()=>{
       this.voiceWriter(userId,id);
       const replay=this.cachedIntent(userId,`message:${id}`,key,source);
@@ -340,7 +344,7 @@ export class ProductionStore {
     });
   }
   addVoiceMessage(userId,id,input,key) {
-    this.writer(userId); const source=this.voiceSource(input,true); this.sweep();
+    this.ugcWriter(userId); const source=this.voiceSource(input,true); this.sweep();
     return this.transaction(()=>{
       const thread=this.voiceWriter(userId,id);
       const result=this.intent(userId,`message:${id}`,key,source,()=>{

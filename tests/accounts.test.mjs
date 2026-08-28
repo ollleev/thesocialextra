@@ -5,7 +5,8 @@ import { createAccountUI } from '../public/accounts.js';
 const PASSWORD = 'synthetic phrase secret for tests';
 const USER = Object.freeze({ id: 'synthetic-account', username: 'synthetic_user' });
 const OTHER = Object.freeze({ id: 'other-account', username: 'other_user' });
-const session = user => ({ mode: 'production', user, ownership: [], moderator: false });
+const RULES=Object.freeze({version:'2026-08-28.1',sha256:'a'.repeat(64),url:'/rules/2026-08-28.1.html',accepted:true});
+const session = user => ({ mode: 'production', user, ownership: [], moderator: false,rules:{...RULES,accepted:Boolean(user)} });
 
 // Only the DOM surfaces used by createAccountUI are simulated. Tests import and
 // execute the real module and its real requestJSON wrapper; there is no copied
@@ -28,6 +29,7 @@ class Element {
     return event;
   }
   setAttribute(name, value) { this.attributes.set(name, value); }
+  removeAttribute(name) { this.attributes.delete(name); }
   close() { this.open = false; for (const listener of this.listeners.get('close') || []) listener({ target: this }); }
   focus() { this.focused = true; }
   select() { this.selected = true; }
@@ -38,7 +40,7 @@ function fixture(t, { onChange } = {}) {
     'account-username-field', 'account-username', 'account-code-field', 'account-code', 'account-password', 'account-password-label',
     'account-password-help', 'account-submit', 'account-consent', 'account-terms', 'account-form', 'recovery-code', 'delete-password',
     'recovery-saved', 'account-close', 'copy-recovery', 'recovery-copy-status', 'recovery-form', 'logout', 'delete-account-form',
-    'delete-account-details', 'delete-confirm', 'cancel-delete-account'];
+    'delete-account-details', 'delete-confirm', 'cancel-delete-account','account-rules-link','account-rules-version'];
   const nodes = new Map(ids.map(id => [id, new Element(id)]));
   const get = id => { assert.ok(nodes.has(id), `Unexpected DOM lookup: ${id}`); return nodes.get(id); };
   const modes = ['register', 'login', 'recover'].map(mode => { const button = new Element(`mode-${mode}`); button.dataset.authMode = mode; return button; });
@@ -88,6 +90,7 @@ function fixture(t, { onChange } = {}) {
     get('account-username').value = USER.username;
     get('account-password').value = PASSWORD;
     get('account-code').value = 'a'.repeat(64);
+    get('account-terms').checked=mode==='register';
   }
   t.after(() => {
     for (const call of unsettled) call.reject();
@@ -134,11 +137,12 @@ for (const mode of ['register', 'recover']) test(`${mode} preserves the one-time
   const operation = f.get('account-form').fire('submit');
   const request = await f.next(`/api/auth/${mode}`);
   assert.deepEqual(JSON.parse(request.options.body), mode === 'register'
-    ? { username: USER.username, password: PASSWORD } : { recoveryCode: 'a'.repeat(64), password: PASSWORD });
-  request.respond({ user: USER, recoveryCode: code }, mode === 'register' ? 201 : 200); await operation;
+    ? { username: USER.username, password: PASSWORD,acceptedRules:true,rulesVersion:RULES.version } : { recoveryCode: 'a'.repeat(64), password: PASSWORD });
+  request.respond({ user: USER, recoveryCode: code,rules:RULES }, mode === 'register' ? 201 : 200); await operation;
   assert.equal(visibleDuringChange, true);
   assert.deepEqual(f.ui.session.user, USER);
   assert.equal(f.get('account-recovery').hidden, false);
+  assert.deepEqual(f.ui.session.rules,RULES);
   assert.equal(f.get('recovery-code').value, code);
   assert.equal(f.get('account-close').hidden, true);
   assert.equal(f.get('account').open, true);
@@ -246,4 +250,30 @@ test('cancelling deletion clears confirmation; only a new explicit password and 
   const request=await f.next('/api/account');assert.equal(request.options.method,'DELETE');assert.deepEqual(JSON.parse(request.options.body),{password:PASSWORD});
   request.respond({},204);await operation;
   assert.equal(f.calls.filter(call=>call.method==='DELETE').length,1);assert.equal(f.ui.session.user,null);
+});
+
+test('registration requires explicit agreement and a changed version unchecks it without discarding the form',async t=>{
+  const f=fixture(t);await f.initialize(null);f.fill('register');f.get('account-terms').checked=false;
+  const before=f.calls.length;await f.get('account-form').fire('submit');assert.equal(f.calls.length,before);
+  f.get('account-terms').checked=true;
+  const read=f.ui.refresh();const updated={...RULES,version:'2026-08-29.1',url:'/rules/2026-08-29.1.html',accepted:false};
+  (await f.next('/api/session')).respond({...session(null),rules:updated});await read;
+  assert.equal(f.get('account-terms').checked,false);assert.equal(f.get('account-password').value,PASSWORD);
+  assert.equal(f.get('account-rules-link').attributes.get('href'),updated.url);
+  f.get('account-terms').checked=true;const operation=f.get('account-form').fire('submit');
+  const request=await f.next('/api/auth/register');assert.equal(JSON.parse(request.options.body).rulesVersion,updated.version);
+  request.respond({error:'rules_version_changed'},409);
+  const latest={...updated,version:'2026-08-30.1',url:'/rules/2026-08-30.1.html'};
+  (await f.next('/api/session')).respond({...session(null),rules:latest});await operation;
+  assert.equal(f.get('account-terms').checked,false);assert.equal(f.get('account-password').value,PASSWORD);
+  assert.equal(f.get('account-username').value,USER.username);assert.equal(f.ui.session.user,null);
+});
+
+test('acceptance updates only rules and invalidates an older pending session read',async t=>{
+  const f=fixture(t);const initial=f.ui.refresh();const original={...session(USER),ownership:['synthetic-post'],features:{voice:true},moderator:true};
+  (await f.next('/api/session')).respond(original);await initial;
+  const old=f.ui.refresh(),request=await f.next('/api/session');
+  const accepted={...RULES,version:'2026-08-29.1',url:'/rules/2026-08-29.1.html'};f.ui.updateRules(accepted);
+  request.respond({...original,rules:{...RULES,accepted:false}});await old;
+  assert.deepEqual(f.ui.session,{...original,rules:accepted});
 });

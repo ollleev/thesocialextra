@@ -29,6 +29,7 @@ Ouvrir ensuite l’adresse locale 4179. HTTP est autorisé uniquement en mode lo
 - Consultation libre ; pseudo et phrase secrète pour publier et échanger. Code de secours, sessions révocables et suppression de compte accessible depuis le web.
 - Annonces visibles 30 min, 1 h, 2 h ou 4 h. Places confirmées manuellement ; un message ne réserve rien. Les annonces pourvues quittent le fil.
 - Douze métiers, carte et fil, recherche par ville et localisation approximative facultative. Catalogue GeoNames de grandes localités, non exhaustif.
+- Accord versionné aux règles de publication, vérifié côté serveur avant les nouvelles contributions ; lecture, sécurité et suppression restent accessibles. Le document fourni est un pilote à remplacer par une nouvelle version validée avant ouverture.
 - Blocage depuis une annonce sans contact préalable, masquage du fil et de la carte pour le compte connecté, gestion des blocages même après expiration du contenu.
 - Conversations privées, messages texte et vocaux facultatifs, blocage et signalements. Conservation jusqu’à sept jours après expiration publique, sauf suppression ou modération.
 - Liens partageables ville/métier/type sans compte ni coordonnées personnelles. Aucun import de groupe, collecte massive ni publication automatique.

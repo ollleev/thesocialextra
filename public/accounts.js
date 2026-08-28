@@ -1,11 +1,22 @@
 import { requestJSON } from './requests.js';
+import { rulesMetadata } from './rule-consent.js';
 
 // Authentication stays in an HttpOnly cookie. This view never stores passwords,
 // recovery codes or session tokens in browser storage.
 export function createAccountUI({ openDialog, onChange, onError }) {
   const dialog = document.querySelector('#account');
   const $ = selector => dialog.querySelector(selector);
-  let session = { mode: 'demo', user: null }, mode = 'login', busy = false, resume, readRevision=0;
+  let session = { mode: 'demo', user: null }, mode = 'login', busy = false, resume, readRevision=0,registrationRules=null;
+  function syncRules() {
+    const next=rulesMetadata(session.rules);
+    if(next?.version!==registrationRules?.version||next?.sha256!==registrationRules?.sha256)$('#account-terms').checked=false;
+    registrationRules=next;
+    $('#account-rules-link').hidden=!next;
+    if(next)$('#account-rules-link').setAttribute('href',next.url);else $('#account-rules-link').removeAttribute('href');
+    $('#account-rules-version').textContent=next?`Version ${next.version}`:'Règles indisponibles. Fermez puis réessayez après actualisation.';
+    $('#account-terms').disabled=!next;
+    if(mode==='register')$('#account-submit').disabled=busy||!next;
+  }
   const labels = {
     login: ['Heureux de vous revoir.', 'Connectez-vous pour retrouver vos annonces et vos échanges.', 'Se connecter'],
     register: ['Un compte. Et c’est parti.', 'Un pseudo et une phrase secrète. Aucun CV à remplir.', 'Créer mon compte gratuit'],
@@ -33,6 +44,7 @@ export function createAccountUI({ openDialog, onChange, onError }) {
     $('#account-submit').textContent = labels[mode][2];
     $('#account-consent').hidden = mode !== 'register';
     $('#account-terms').required = mode === 'register';
+    syncRules();
     dialog.querySelectorAll('[data-auth-mode]').forEach(button => {
       button.hidden = resume === showDeletion && button.dataset.authMode === 'register';
       button.classList.toggle('active', button.dataset.authMode === mode);
@@ -60,16 +72,18 @@ export function createAccountUI({ openDialog, onChange, onError }) {
     catch (error) { if (error.status === 404) next = { mode: 'demo', user: null }; else throw error; }
     if(revision!==readRevision)return session;
     session=next;
+    syncRules();
     await onChange(session);
     return session;
   }
-  async function applyAuthResult(user) {
-    ++readRevision;session={mode:'production',user,ownership:[],moderator:false};
+  async function applyAuthResult(user,rules) {
+    ++readRevision;session={mode:'production',user,ownership:[],moderator:false,rules:rulesMetadata(rules)};syncRules();
     await onChange(session);
   }
   function setBusy(value) {
     busy = value;
     dialog.querySelectorAll('button').forEach(button => { button.disabled = value; });
+    if(!value&&mode==='register'&&!registrationRules)$('#account-submit').disabled=true;
   }
   function finish() {
     $('#recovery-code').value = '';
@@ -88,10 +102,12 @@ export function createAccountUI({ openDialog, onChange, onError }) {
   dialog.querySelectorAll('[data-auth-mode]').forEach(button => button.addEventListener('click', () => { if (!busy) render(button.dataset.authMode); }));
   $('#account-form').addEventListener('submit', async event => {
     event.preventDefault(); if (busy) return;
+    if(mode==='register'&&(!registrationRules||!$('#account-terms').checked))return;
     setBusy(true); ++readRevision; $('#account-error').hidden = true;
     try {
       const payload = mode === 'recover' ? { recoveryCode: $('#account-code').value.trim(), password: $('#account-password').value }
         : { username: $('#account-username').value.trim(), password: $('#account-password').value };
+      if(mode==='register')Object.assign(payload,{acceptedRules:true,rulesVersion:registrationRules.version});
       const result = await requestJSON(`/api/auth/${mode}`, { method: 'POST', body: payload });
       $('#account-form').reset();
       if (result.recoveryCode) {
@@ -104,11 +120,14 @@ export function createAccountUI({ openDialog, onChange, onError }) {
       }
       // Display the one-time recovery code before a follow-up read: a failed
       // session refresh must never discard a successfully issued recovery key.
-      await applyAuthResult(result.user);
+      await applyAuthResult(result.user,result.rules);
       try { await refresh(); }
       catch (error) { if (resume !== showDeletion || result.recoveryCode) throw error; }
       if (!result.recoveryCode) finish();
-    } catch (error) { $('#account-error').textContent = onError(error); $('#account-error').hidden = false; }
+    } catch (error) {
+      if(error.code==='rules_version_changed'){try{await refresh();}catch{/* Preserve the form and its error if the new version is unavailable. */}}
+      $('#account-error').textContent = onError(error); $('#account-error').hidden = false;
+    }
     finally { setBusy(false); }
   });
   $('#copy-recovery').addEventListener('click', async () => {
@@ -132,6 +151,7 @@ export function createAccountUI({ openDialog, onChange, onError }) {
   });
   return {
     refresh, show, showDeletion,
+    updateRules(rules) {++readRevision;session={...session,rules:rulesMetadata(rules)};syncRules();},
     get session() { return session; },
     require(continuation) { if (session.mode !== 'production' || session.user) return true; show('register', continuation); return false; },
   };

@@ -11,6 +11,7 @@ import { ProductionStore } from './production-store.mjs';
 import { openDatabase } from './database.mjs';
 import { readVoiceBody, sendVoice } from './voice-http.mjs';
 import { normalizeViaWorker } from './voice-worker.mjs';
+import { RULES, rulesDocument } from './rules.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MUTATING = new Set(['POST', 'PATCH', 'DELETE', 'PUT']);
@@ -89,6 +90,8 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
   maxBlocksPerUser=500, maxTotalBlocks=100000,
   maxStreams=256, maxStreamsPerIp=8, sweepIntervalMs=1000, heartbeatIntervalMs=15_000 }={}) {
   const {url:origin,secure}=configuredOrigin(publicOrigin,allowLocalHttp);
+  if(authOptions.testRules!==undefined)throw new TypeError('The HTTP server always uses the verified rules document');
+  const verifiedRulesBytes=rulesDocument();
   if(voiceSocketPath!==null && (typeof voiceSocketPath!=='string'||!path.isAbsolute(voiceSocketPath)||voiceSocketPath.length>100||/[\0\r\n]/.test(voiceSocketPath))) throw new TypeError('A trusted absolute voice socket is required');
   if(testVoiceProcessor!==undefined && (!process.env.NODE_TEST_CONTEXT || typeof testVoiceProcessor!=='function')) throw new TypeError('Voice injection is for the native test runner only');
   const processVoice=testVoiceProcessor??((bytes,options)=>normalizeViaWorker(bytes,{...options,socketPath:voiceSocketPath}));
@@ -97,7 +100,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
     if(!Number.isSafeInteger(value)||value<1) throw new TypeError('Limits and intervals must be positive integers');
   const trusted=new Set(trustedProxyAddresses.map(normalizeIp));
   if([...trusted].some(ip=>!isIP(ip))) throw new TypeError('Trusted proxies must be exact IP addresses');
-  const auth=new AuthService({...authOptions,db,clock}), store=new ProductionStore({db,clock,moderators,maxBlocksPerUser,maxTotalBlocks});
+  const auth=new AuthService({...authOptions,db,clock}), store=new ProductionStore({db,clock,moderators,maxBlocksPerUser,maxTotalBlocks,hasAcceptedRules:userId=>auth.hasAcceptedRules(userId)});
   const moderatorIds=new Set(moderators), cookieName=secure?'__Host-extra_session':'extra_session';
   const staticRoot=path.resolve(publicDir), rates=new Map(), streams=new Set();
   let disposed=false, scheduled=false, broadcasting=false, privateScheduled=false;
@@ -188,7 +191,11 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       // while a slow request was uploading. Never authorize writes from stale user data.
       const currentUserId=()=>requireUser(auth.session(token));
       if(user&&pathname.startsWith('/api/')) rate(`account:${user.id}`,accountRateLimit);
-      if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id)),...(voiceSocketPath?{features:{voice:true}}:{})});
+      if(req.method==='GET'&&pathname==='/api/session') return json(res,200,{mode:'production',user,ownership:user?store.ownership(user.id):[],moderator:Boolean(user&&moderatorIds.has(user.id)),rules:auth.rulesStatus(user?.id),...(voiceSocketPath?{features:{voice:true}}:{})});
+      if(req.method==='POST'&&pathname==='/api/account/rules-acceptance') {
+        requireUser(user);const input=await body(req);
+        return json(res,200,auth.acceptRules(currentUserId(),input));
+      }
       if(req.method==='GET'&&pathname==='/api/blocks') {
         const actor=requireUser(user);
         for(const name of searchParams.keys())if(name!=='cursor'||searchParams.getAll(name).length!==1)fail(400,'invalid_cursor');
@@ -205,7 +212,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
         else if(action==='recover') rate(`auth-recovery:${hash(typeof input.recoveryCode==='string'?input.recoveryCode:'invalid-recovery-code')}`,authAccountRateLimit,authWindowMs);
         const result=await auth[action](input);
         auth.logout(token);setSession(res,result.sessionToken);
-        return json(res,action==='register'?201:200,{user:result.user,...(result.recoveryCode?{recoveryCode:result.recoveryCode}:{})});
+        return json(res,action==='register'?201:200,{user:result.user,rules:result.rules,...(result.recoveryCode?{recoveryCode:result.recoveryCode}:{})});
       }
       if(req.method==='DELETE'&&pathname==='/api/account') {
         requireUser(user);rate(`auth-ip:${ip}`,authRateLimit,authWindowMs);rate(`auth-name:${hash(user.username)}`,authAccountRateLimit,authWindowMs);
@@ -266,7 +273,7 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
         if(req.method==='POST'&&operation==='voice') {
           if(!voiceSocketPath)fail(404,'route_not_found');
           const key=intentKey(req);
-          store.writer(actor);
+          store.ugcWriter(actor);
           const thread=store.threadAccess(actor,id);
           if(store.blocked(thread.owner_id,thread.guest_id))fail(403,'contact_blocked');
           if(voiceAdmitted)fail(429,'audio_busy');
@@ -291,6 +298,10 @@ export function createProductionServer({ db, publicOrigin, publicDir=path.join(H
       if(!['GET','HEAD'].includes(req.method))fail(405,'method_not_allowed');
       let decoded;try{decoded=decodeURIComponent(pathname);}catch{fail(400,'invalid_path');}
       if(decoded.includes('\0')||decoded.includes('\\')||decoded.split('/').some(part=>part.startsWith('.')))fail(404,'not_found');
+      if(path.posix.normalize(decoded)===RULES.url) {
+        res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Content-Length':verifiedRulesBytes.length});
+        return res.end(req.method==='HEAD'?undefined:verifiedRulesBytes);
+      }
       const filename=path.resolve(staticRoot,decoded==='/'?'index.html':decoded.slice(1)),mime=MIME[path.extname(filename)];
       if(!filename.startsWith(`${staticRoot}${path.sep}`)||!mime)fail(404,'not_found');
       let bytes;try{const [file,root]=await Promise.all([realpath(filename),realpath(staticRoot)]);if(!file.startsWith(`${root}${path.sep}`))fail(404,'not_found');bytes=await readFile(file);}catch{fail(404,'not_found');}

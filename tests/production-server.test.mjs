@@ -2,11 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import {createHash,randomUUID} from 'node:crypto';
-import {mkdtemp,writeFile,symlink,rm} from 'node:fs/promises';
+import {mkdtemp,writeFile,symlink,rm,mkdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {openDatabase} from '../database.mjs';
 import {createProductionServer} from '../production-server.mjs';
+import {RULES} from '../rules.mjs';
+
+const AGREEMENT={acceptedRules:true,rulesVersion:RULES.version};
 
 const PASSWORD='synthetic password sufficiently long';
 const testKdf=async(password,salt)=>createHash('sha512').update(password).update(salt).digest();
@@ -27,7 +30,7 @@ async function fixture(t,options={}) {
       req.on('error',reject);req.end(payload);
     });
   }
-  async function register(username) {const r=await request('/api/auth/register',{method:'POST',body:{username,password:PASSWORD}});assert.equal(r.status,201,JSON.stringify(r.data));return r;}
+  async function register(username) {const r=await request('/api/auth/register',{method:'POST',body:{username,password:PASSWORD,...AGREEMENT}});assert.equal(r.status,201,JSON.stringify(r.data));return r;}
   function stream(url='/api/events',cookie) {
     return new Promise((resolve,reject)=>{
       const req=http.get({hostname:'127.0.0.1',port,path:url,headers:{Host:new URL(publicOrigin).host,...(cookie?{Cookie:cookie}:{})}},res=>{
@@ -69,11 +72,11 @@ test('the public deletion page and account link are readable without authenticat
 
 test('cookie-only sessions expose no tokens, validate strictly, and enforce origin and host',async t=>{
   const f=await fixture(t),r=await f.register('COOKIE_USER');
-  assert.deepEqual(Object.keys(r.data).sort(),['recoveryCode','user']);assert.equal(r.data.user.username,'cookie_user');
+  assert.deepEqual(Object.keys(r.data).sort(),['recoveryCode','rules','user']);assert.equal(r.data.user.username,'cookie_user');
   assert.match(r.headers['set-cookie'][0],/^__Host-extra_session=[a-f0-9]{64}; Path=\/; HttpOnly; SameSite=Lax; Max-Age=2592000; Secure$/);
   assert.equal(r.headers['strict-transport-security'],'max-age=31536000');
   const session=await f.request('/api/session',{cookie:r.cookie});
-  assert.deepEqual(session.data,{mode:'production',user:r.data.user,ownership:[],moderator:false});
+  assert.deepEqual(session.data,{mode:'production',user:r.data.user,ownership:[],moderator:false,rules:{...RULES,accepted:true}});
   const token=r.cookie.split('=')[1];
   assert.equal((await f.request('/api/session',{headers:{'X-Owner-Token':token,Authorization:`Bearer ${token}`}})).data.user,null);
   for(const cookie of [`${r.cookie}; ${r.cookie}`,`${r.cookie}x`,'broken',`${r.cookie}; __Host-extra_session=anything`])assert.equal((await f.request('/api/session',{cookie})).status,400);
@@ -264,10 +267,12 @@ test('moderation routes enforce moderator identity and removal',async t=>{
 });
 
 test('a slow request cannot mutate after its session is revoked during body upload',async t=>{
-  for(const operation of ['create','block']) {
-  const f=await fixture(t),owner=await f.register('slow_owner'),payload=JSON.stringify(operation==='create'?input():{});
-  const post=operation==='block'?f.app.store.create('synthetic-target',input(),key()).post:null;
-  const route=post?`/api/posts/${post.id}/block`:'/api/posts';
+  for(const operation of ['create','block','acceptance']) {
+  const f=await fixture(t),owner=await f.register('slow_owner'),payload=JSON.stringify(operation==='create'?input():operation==='acceptance'?AGREEMENT:{});
+  if(operation==='acceptance')f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(owner.data.user.id);
+  const target=operation==='block'?await f.register('synthetic_target'):null;
+  const post=target?f.app.store.create(target.data.user.id,input(),key()).post:null;
+  const route=post?`/api/posts/${post.id}/block`:operation==='acceptance'?'/api/account/rules-acceptance':'/api/posts';
   let pending;
   const accepted=new Promise(resolve=>f.app.server.once('request',resolve));
   const response=new Promise((resolve,reject)=>{
@@ -277,6 +282,7 @@ test('a slow request cannot mutate after its session is revoked during body uplo
   await f.request('/api/auth/logout',{method:'POST',cookie:owner.cookie,body:{}});
   pending.end(payload.slice(1));assert.equal(await response,401);assert.equal(f.app.store.state().posts.length,post?1:0);
   assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_blocks').get().n,0);
+  if(operation==='acceptance')assert.equal(f.app.auth.hasAcceptedRules(owner.data.user.id),false);
   }
 });
 
@@ -367,17 +373,20 @@ test('voice upload rechecks the cookie after conversion instead of storing under
   assert.equal(f.app.store.readThread(f.guest.data.user.id,f.chat.threadId).thread.messages.length,1);
 });
 
-test('voice conversion cannot cross a block, expiry or target removal that happened while waiting',async t=>{
-  for(const action of ['block','expiry','remove']) {
+test('voice conversion cannot cross a block, missing rules agreement, expiry or target removal while waiting',async t=>{
+  for(const action of ['block','rules','expiry','remove']) {
     let release,entered;const started=new Promise(resolve=>entered=resolve);
     const f=await voiceFixture(t,{testVoiceProcessor:()=>{entered();return new Promise(resolve=>release=()=>resolve(normalizedVoice()));}});
     const pending=f.send();await started;
     try {
       if(action==='block')f.app.store.block(f.guest.data.user.id,f.chat.threadId);
+      else if(action==='rules')f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(f.owner.data.user.id);
       else if(action==='expiry')f.advance(8*24*60*60_000);
       else f.app.store.remove(f.owner.data.user.id,f.post.id);
     } finally {release();}
-    assert.equal((await pending).status,action==='block'?403:404);
+    const response=await pending;
+    assert.equal(response.status,['block','rules'].includes(action)?403:404);
+    if(action==='rules')assert.equal(response.data.error,'rules_acceptance_required');
     assert.equal(f.db.prepare('SELECT COUNT(*) n FROM app_messages WHERE text=\'\'').get().n,0);
   }
 });
@@ -402,4 +411,70 @@ test('report voice playback stays moderator-only after removal and vanishes on a
   const proof=await f.request(route,{cookie:f.owner.cookie});assert.equal(proof.status,200);assert.deepEqual(proof.bytes,normalizedVoice().bytes);
   assert.equal((await f.request('/api/account',{method:'DELETE',cookie:f.guest.cookie,body:{password:PASSWORD}})).status,204);
   assert.equal((await f.request(route,{cookie:f.owner.cookie})).status,404);
+});
+
+test('rules HTTP metadata identifies the exact served document and registration cannot bypass explicit agreement',async t=>{
+  const f=await fixture(t);
+  assert.deepEqual((await f.request('/api/session')).data.rules,{...RULES,accepted:false});
+  const document=await f.request(RULES.url);assert.equal(document.status,200);
+  assert.equal(createHash('sha256').update(document.bytes).digest('hex'),RULES.sha256);
+  assert.match(document.text,/Version 2026-08-28.1/);assert.match(document.text,/mentions de l’opérateur/);
+  const head=await f.request(RULES.url,{method:'HEAD'});assert.equal(head.text,'');assert.equal(Number(head.headers['content-length']),document.bytes.length);
+  for(const fields of [{},{acceptedRules:false,rulesVersion:RULES.version},{acceptedRules:'true',rulesVersion:RULES.version}]) {
+    const denied=await f.request('/api/auth/register',{method:'POST',body:{username:'rules_register',password:PASSWORD,...fields}});
+    assert.equal(denied.status,403);assert.equal(denied.data.error,'rules_acceptance_required');
+  }
+  assert.equal((await f.request('/api/auth/register',{method:'POST',body:{username:'rules_register',password:PASSWORD,acceptedRules:true,rulesVersion:'old'}})).status,409);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,0);
+  const registered=await f.register('rules_register');assert.deepEqual(registered.data.rules,{...RULES,accepted:true});
+  assert.equal((await f.request('/api/account/rules-acceptance',{method:'POST',body:AGREEMENT})).status,401);
+  assert.equal((await f.request('/api/account/rules-acceptance',{method:'POST',cookie:registered.cookie,body:AGREEMENT,origin:false})).status,403);
+  assert.equal((await f.request('/api/account/rules-acceptance',{method:'POST',cookie:registered.cookie,body:{...AGREEMENT,userId:'other'}})).status,400);
+});
+
+test('encoded and repeated-slash rules paths serve the verified bytes, never a replaced disk document',async t=>{
+  const publicDir=await mkdtemp(path.join(tmpdir(),'extras-rules-static-'));t.after(()=>rm(publicDir,{recursive:true,force:true}));
+  await mkdir(path.join(publicDir,'rules'));
+  await writeFile(path.join(publicDir,RULES.url.slice(1)),'Synthetic modified document, not approved.');
+  const f=await fixture(t,{publicDir});
+  for(const pathname of [RULES.url,RULES.url.replace('/2026','/%32026'),RULES.url.replace('/rules/','/rules//')]) {
+    const response=await f.request(pathname);assert.equal(response.status,200);
+    assert.equal(createHash('sha256').update(response.bytes).digest('hex'),RULES.sha256);
+  }
+});
+
+test('an unaccepted account keeps account, reading and safety access but cannot write UGC until agreement',async t=>{
+  const f=await voiceFixture(t),voiceKey=key(),sent=await f.send({headers:{'Content-Type':'audio/webm','Idempotency-Key':voiceKey}});
+  assert.equal(sent.status,201);
+  f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id IN (?,?)').run(f.owner.data.user.id,f.guest.data.user.id);
+  assert.equal((await f.request('/api/session',{cookie:f.owner.cookie})).data.rules.accepted,false);
+  const login=await f.request('/api/auth/login',{method:'POST',body:{username:'voice_owner',password:PASSWORD}});assert.equal(login.status,200);assert.equal(login.data.rules.accepted,false);
+  const recovery=await f.request('/api/auth/recover',{method:'POST',body:{recoveryCode:f.guest.data.recoveryCode,password:PASSWORD}});assert.equal(recovery.status,200);assert.equal(recovery.data.rules.accepted,false);f.guest.cookie=recovery.cookie;
+  const post=`/api/posts/${f.post.id}`,thread=`/api/threads/${f.chat.threadId}`;
+  for(const route of ['/api/state',post,thread,`/api/voice/${sent.data.message.id}`,'/api/blocks'])assert.equal((await f.request(route,{cookie:f.owner.cookie})).status,200);
+  const denied=[
+    await f.request('/api/posts',{method:'POST',cookie:f.owner.cookie,body:input(),headers:{'Idempotency-Key':key()}}),
+    await f.request(post+'/contact',{method:'POST',cookie:f.guest.cookie,body:{message:'New synthetic contact.'},headers:{'Idempotency-Key':key()}}),
+    await f.request(thread+'/messages',{method:'POST',cookie:f.owner.cookie,body:{message:'New synthetic message.'},headers:{'Idempotency-Key':key()}}),
+    await f.send({headers:{'Content-Type':'audio/webm','Idempotency-Key':voiceKey}}),await f.send(),
+  ];
+  for(const response of denied){assert.equal(response.status,403);assert.equal(response.data.error,'rules_acceptance_required');}
+  assert.equal(f.calls(),1);
+  const report=await f.request('/api/reports',{method:'POST',cookie:f.guest.cookie,body:{targetType:'thread',targetId:f.chat.threadId,reason:'other'},headers:{'Idempotency-Key':key()}});assert.equal(report.status,201);
+  const block=await f.request(post+'/block',{method:'POST',cookie:f.guest.cookie,body:{}});assert.equal(block.status,200);
+  assert.equal((await f.request(`/api/blocks/${block.data.blockId}`,{method:'DELETE',cookie:f.guest.cookie})).status,200);
+  for(const action of ['fill','close'])assert.equal((await f.request(post,{method:'PATCH',cookie:f.owner.cookie,body:{action},headers:{'Idempotency-Key':key()}})).status,200);
+  assert.equal((await f.request(post,{method:'PATCH',cookie:f.owner.cookie,body:{action:'reopen'},headers:{'Idempotency-Key':key()}})).data.error,'rules_acceptance_required');
+  const publicBefore=f.app.store.state().version,privateBefore=f.app.store.feedRevision(f.owner.data.user.id),events=[];
+  f.app.store.subscribe(()=>events.push('public'));f.app.store.subscribePrivate(()=>events.push('private'));
+  const accepted=await f.request('/api/account/rules-acceptance',{method:'POST',cookie:f.owner.cookie,body:AGREEMENT});assert.deepEqual(accepted.data,{rules:{...RULES,accepted:true}});
+  const first=f.db.prepare('SELECT accepted_at FROM auth_rule_acceptances WHERE user_id=?').get(f.owner.data.user.id).accepted_at;
+  f.advance(1000);assert.equal((await f.request('/api/account/rules-acceptance',{method:'POST',cookie:f.owner.cookie,body:AGREEMENT})).status,200);
+  assert.equal(f.db.prepare('SELECT accepted_at FROM auth_rule_acceptances WHERE user_id=?').get(f.owner.data.user.id).accepted_at,first);
+  assert.equal(f.app.store.state().version,publicBefore);assert.equal(f.app.store.feedRevision(f.owner.data.user.id),privateBefore);assert.deepEqual(events,[]);
+  assert.equal((await f.request(post,{method:'PATCH',cookie:f.owner.cookie,body:{action:'reopen'},headers:{'Idempotency-Key':key()}})).status,200);
+  assert.equal((await f.request(thread+'/messages',{method:'POST',cookie:f.owner.cookie,body:{message:'Explicitly sent after agreement.'},headers:{'Idempotency-Key':key()}})).status,201);
+  f.db.prepare('DELETE FROM auth_rule_acceptances WHERE user_id=?').run(f.owner.data.user.id);
+  assert.equal((await f.request(post,{method:'DELETE',cookie:f.owner.cookie})).status,204);
+  assert.equal((await f.request('/api/account',{method:'DELETE',cookie:f.guest.cookie,body:{password:PASSWORD}})).status,204);
 });

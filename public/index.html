@@ -14,7 +14,7 @@
   <script src="/app.js" type="module"></script>
 </head>
 <body>
-<a class="skip-link" href="#main">Aller aux annonces</a>
+  <a class="skip-link" href="#main">Aller aux annonces</a>
   <header class="header">
     <a class="brand" href="/" aria-label="thesocialextra, accueil">thesocialextra<span>.</span><span class="brand-wave" aria-hidden="true"></span></a>
     <nav class="navigation" aria-label="Navigation principale">
@@ -91,7 +91,7 @@
         <label id="account-username-field" class="field-label" for="account-username">Votre pseudo<input id="account-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" minlength="3" maxlength="32" pattern="[A-Za-z0-9_-]{3,32}" required><span class="field-help">3 à 32 lettres, chiffres, tirets. Choisissez un pseudo, pas votre nom complet.</span></label>
         <label id="account-code-field" class="field-label" for="account-code" hidden>Code de secours<input id="account-code" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="64" pattern="[a-f0-9]{64}"></label>
         <label class="field-label" for="account-password"><span id="account-password-label">Phrase secrète</span><input type="password" id="account-password" name="password" autocomplete="current-password" maxlength="256" required><span id="account-password-help" class="field-help">Au moins 15 caractères. Plusieurs mots sont plus faciles à retenir. Vous pouvez coller une phrase générée.</span></label>
-        <label id="account-consent" class="consent"><input type="checkbox" id="account-terms">J’ai lu les <a href="/privacy.html" target="_blank" rel="noopener">règles de confidentialité et d’utilisation</a>.</label>
+        <div id="account-consent"><label class="consent"><input type="checkbox" id="account-terms">J’accepte les <a id="account-rules-link" target="_blank" rel="noopener" hidden>règles de publication</a>.</label><p id="account-rules-version" class="field-help">Chargement des règles…</p><p class="field-help"><a href="/privacy.html" target="_blank" rel="noopener">Comment mes données sont utilisées</a></p></div>
         <button class="button lime" id="account-submit" type="submit">Se connecter</button>
       </form>
       <button class="text-button" type="button" data-auth-mode="recover">Phrase secrète oubliée ?</button>
@@ -108,5 +108,6 @@
       <details id="delete-account-details" class="delete-account"><summary>Supprimer mon compte</summary><p>Cette action supprime votre compte, vos annonces, vos conversations (texte et vocaux) et les signalements associés de la base active. Elle est irréversible. <a href="/delete-account.html" target="_blank" rel="noopener">Détails et limites concernant les sauvegardes</a>.</p><form id="delete-account-form"><label class="field-label" for="delete-password">Confirmez votre phrase secrète<input id="delete-password" type="password" autocomplete="current-password" maxlength="256" required></label><label class="consent"><input id="delete-confirm" type="checkbox" required>Je confirme la suppression du compte et de ses données.</label><button class="button danger" type="submit">Supprimer définitivement</button><button class="button outline" id="cancel-delete-account" type="button">Annuler</button></form></details>
     </div><p id="account-error" class="form-error" role="alert" hidden></p>
   </div></dialog>
+  <dialog id="rules-consent" class="sheet" aria-labelledby="rules-title"><div class="sheet-inner"><h2 id="rules-title">Avant de publier.</h2><p class="sheet-subtitle">Des annonces utiles, des échanges respectueux. Ces règles s’appliquent aux annonces, aux messages et aux vocaux.</p><p class="field-help">Lire, signaler, bloquer ou supprimer reste possible sans nouvel accord. Votre brouillon reste dans la fenêtre précédente.</p><a id="rules-document" class="button outline" target="_blank" rel="noopener" hidden>Lire les règles de publication</a><p id="rules-version" class="field-help"></p><form id="rules-form"><label class="consent"><input id="rules-agree" type="checkbox" required>J’ai lu et j’accepte cette version des règles.</label><button id="rules-accept" class="button lime" type="submit" disabled>Accepter et revenir</button></form><button id="rules-cancel" class="button outline" type="button">Pas maintenant</button><p class="fine-print">Rien ne sera publié ou envoyé automatiquement.</p><p id="rules-error" class="form-error" role="alert" hidden></p><button id="rules-retry" class="text-button" type="button">Actualiser les règles</button></div></dialog>
 </body>
 </html>

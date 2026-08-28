@@ -6,6 +6,7 @@ import { createAccountUI } from './accounts.js';
 import { makeFeedShare, parseFeedLink } from './sharing.js';
 import { VoiceComposer, uploadVoice } from './voice.js';
 import { createBlockUI } from './blocks.js';
+import { createRulesUI } from './rule-consent.js';
 
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -48,7 +49,7 @@ const accounts = createAccountUI({openDialog,onError:errorText,onChange:async se
   $('#moderation-button').hidden=!session.moderator;
   if(state.production) {
     if(changed) {
-      accountGeneration++;state.feedRevision=0;blockUI.reset();$('#blocks').close();$('#block-author').close(); for(const id of Object.keys(threads)) delete threads[id];
+      accountGeneration++;state.feedRevision=0;blockUI.reset();rulesUI.reset();$('#blocks').close();$('#block-author').close(); for(const id of Object.keys(threads)) delete threads[id];
       voice.discard();stopAudio($('#chat'),true);stopAudio($('#moderation'),true);
       outbox.retain(new Set());writeIntents.clear();mutationKeys.clear();state.chat=null;state.chatPrivacyPending=false;
       state.mine=false;state.posts=[];state.readMarkers=state.user?readSession(`thesocialextra-read:${state.user.id}`):{};
@@ -66,16 +67,22 @@ const accounts = createAccountUI({openDialog,onError:errorText,onChange:async se
     $('#help .help-copy').innerHTML='<p><strong>Vous êtes dispo ?</strong><br>Choisissez votre métier, une ville et une durée. Votre point apparaît en vert.</p><p><strong>Il manque quelqu’un ?</strong><br>Publiez votre besoin. Parlez-vous, puis confirmez chaque place vous-même. Un message ne réserve rien.</p><p><strong>Le fil reste frais.</strong><br>Les annonces pourvues quittent le fil public. Vous pouvez rouvrir une place jusqu’à l’expiration initiale. Les conversations privées restent disponibles sept jours après cette expiration, sauf suppression ou modération.</p><p><strong>Vous gardez la main.</strong><br>La localisation est approximative, à votre demande. Signalez un contenu ou bloquez un compte depuis une annonce ou un échange. Gérez vos blocages dans Mon compte. Les réponses sont actualisées quand l’application est visible ; pas de notification quand elle est fermée.</p><p><strong>Gratuit des deux côtés.</strong><br>Ni paiement ni contrat ne sont gérés ici. Les identités, compétences et autorisations de travail ne sont pas vérifiées. Convenez des conditions et effectuez les vérifications nécessaires avant toute mission.</p><p><a href="/privacy.html">Confidentialité et règles d’utilisation</a></p>';
   }
   renderVoice();
+  rulesUI.changed();
   if(liveReady) { void changeFeed();void pollUpdates(); }
 }});
 $('#account-button').addEventListener('click',()=>accounts.show());
 const blockUI=createBlockUI({$,api,requireAccount:next=>accounts.require(next),getGeneration:()=>accountGeneration,openDialog,errorText,toast,onRevision:applyFeedRevision,refreshFeed:async()=>{await changeFeed();void pollUpdates();void refreshChat();}});
+const rulesUI=createRulesUI({$,api,getSession:()=>accounts.session,getGeneration:()=>accountGeneration,refreshSession:()=>accounts.refresh(),applyRules:rules=>accounts.updateRules(rules),errorText,beforeOpen:()=>{if(voice.phase==='requesting')voice.discard();else if(voice.phase==='recording')voice.stop();}});
+function requireUGC(next) {if(!accounts.require(()=>{if(rulesUI.require(next))next?.();}))return false;return rulesUI.require(next);}
+function rulesError(error,next,account=accountGeneration) {if(account!==accountGeneration||!['rules_acceptance_required','rules_version_changed'].includes(error.code))return false;void rulesUI.renew(next);return true;}
 let composerGeneration = 0, publishing = false;
 const now = () => Date.now() + state.offset;
 let toastTimer, chatTimer;
 let updatesRequest, updatesCursor = 0, updatesError = false, updatesCheckedAt = 0;
 function toast(message) { clearTimeout(toastTimer); $('#toast').textContent = message; $('#toast').hidden = false; toastTimer = setTimeout(() => $('#toast').hidden = true, 4500); }
 function errorText(error) {
+  if(error.code==='rules_acceptance_required')return 'Acceptez les règles de publication pour publier ou envoyer un message. Votre brouillon est conservé.';
+  if(error.code==='rules_version_changed')return 'Les règles ont changé. Lisez la nouvelle version puis cochez à nouveau la case.';
   if(error.code==='block_capacity_reached')return 'Votre liste de comptes bloqués a atteint sa capacité. Vos blocages existants restent actifs.';
   if(error.code==='total_block_capacity_reached')return 'Le service de blocage a atteint sa capacité. Vos blocages existants restent actifs. Réessayez plus tard.';
   const voiceErrors={microphone_denied:'Le micro n’a pas été autorisé. Vous pouvez toujours écrire.',recording_unavailable:'Le micro est indisponible. Vérifiez les permissions ou écrivez votre message.',recording_failed:'L’enregistrement a été interrompu. Réessayez ou utilisez le texte.',recording_empty:'Aucun son enregistré. Réessayez ou utilisez le texte.',recording_interrupted:'Enregistrement effacé lorsque l’application a été masquée.',audio_busy:'Un vocal est en cours de traitement. Attendez un instant puis réessayez.',audio_too_large:'Ce vocal est trop volumineux. Enregistrez un message plus court.',audio_too_long:'Le vocal dépasse une minute. Enregistrez un message plus court.',invalid_audio:'Ce vocal ne peut pas être lu. Effacez-le puis réessayez.',unsupported_audio_type:'Ce format audio n’est pas accepté. Utilisez un autre navigateur ou le texte.',audio_processing_unavailable:'Le service vocal est indisponible. Votre enregistrement reste ici ; vous pouvez aussi écrire.',audio_processing_timeout:'Le traitement a pris trop de temps. Réessayez le même enregistrement.',voice_thread_capacity_reached:'La limite de 20 vocaux de cet échange est atteinte. Le texte reste disponible.',voice_user_capacity_reached:'Votre espace vocal est plein. Le texte reste disponible.',voice_total_capacity_reached:'Le service vocal a atteint sa capacité. Le texte reste disponible.',report_voice_capacity_reached:'Le stockage des preuves vocales est plein. Aucun signalement enregistré ; bloquez l’interlocuteur si nécessaire et réessayez plus tard.'};
@@ -173,7 +180,7 @@ $$('dialog').forEach(dialog => {
   dialog.addEventListener('close', () => { if (dialog.id === 'chat' && !dialog.open) { clearInterval(chatTimer); state.chat = null; voice.discard();stopAudio(dialog); } if(dialog.id==='moderation')stopAudio(dialog); });
 });
 function openComposer(kind) {
-  if(!accounts.require(()=>openComposer(kind))) return;
+  if(!requireUGC(()=>openComposer(kind))) return;
   if (publishing) { openDialog($('#composer')); toast('Publication en cours. Attendez sa confirmation.'); return; }
   ++composerGeneration;
   state.formKind = kind; $('#post-form').reset(); $('#need-fields').hidden = kind !== 'need';
@@ -186,12 +193,14 @@ function openComposer(kind) {
 }
 $('#available-button').addEventListener('click', () => openComposer('available')); $('#need-button').addEventListener('click', () => openComposer('need'));
 $('#post-form').addEventListener('submit', async event => {
-  event.preventDefault(); const button = $('#publish-button'); if (button.disabled) return; const data = new FormData(event.currentTarget);
+  event.preventDefault(); const button = $('#publish-button'); if (button.disabled) return;
+  if(!requireUGC(()=>{if($('#composer').open)button.focus();}))return;
+  const data = new FormData(event.currentTarget);
   const payload = { kind: state.formKind, role: data.get('role'), cityId: state.city.id, english: data.has('english'), vehicle: data.has('vehicle'), durationMinutes: Number(data.get('durationMinutes')), note: data.get('note').trim() };
   if (state.point) payload.point = state.point;
   else if (state.city.id === '2988507') payload.zoneId = data.get('zoneId');
   if (payload.kind === 'need') payload.places = Number(data.get('places'));
-  const generation = composerGeneration;
+  const generation = composerGeneration,accountAtRequest=accountGeneration;
   publishing = true; button.disabled = true; $('#form-error').hidden = true;
   try {
     const generationAtWrite=accountGeneration;
@@ -208,6 +217,7 @@ $('#post-form').addEventListener('submit', async event => {
     state.selected = result.post.id; map.recenter(result.post); render(); $('#composer').close();
     toast(state.production?'Votre annonce est en direct.':'Votre annonce est en direct dans cet essai local.'); openDetail(result.post.id);
   } catch (error) {
+    rulesError(error,()=>{if($('#composer').open)button.focus();},accountAtRequest);
     const message = errorText(error) + (!error.status ? state.production?' Réessayez avec le même texte : une seule annonce sera créée.':' Vérifiez le fil avant de republier : l’annonce a peut-être été créée.' : '');
     if (generation === composerGeneration && $('#composer').open) { $('#form-error').textContent = message; $('#form-error').hidden = false; }
     else toast(message);
@@ -315,10 +325,10 @@ function openDetail(id) {
   updateDetail(post); openDialog($('#detail'));
   const form = $('#contact-form'); if (form) form.addEventListener('submit', async e => {
     e.preventDefault(); const button = form.querySelector('button[type="submit"]'); if (button.disabled) return;
-    if(!accounts.require(()=>{openDialog($('#detail'));form.querySelector('textarea').focus();})) return;
+    if(!requireUGC(()=>{if(state.detailId===id){if(!$('#detail').open)openDialog($('#detail'));form.querySelector('textarea').focus();}})) return;
     const current = state.posts.find(p => p.id === id && p.expiresAt > now());
     if (!current || current.status !== 'open') { if (current) updateDetail(current); else render(); return; }
-    button.disabled = true; form.dataset.submitting = 'true'; $('#detail-error').hidden = true;
+    button.disabled = true; form.dataset.submitting = 'true'; $('#detail-error').hidden = true;const accountAtRequest=accountGeneration;
     try {
       const payload={message:form.querySelector('textarea').value.trim()},generationAtWrite=accountGeneration;
       const result = await api(`/api/posts/${id}/contact`, { method: 'POST', body:payload,idempotencyKey:state.production?writeKey(`contact:${id}`,payload):undefined });
@@ -330,7 +340,7 @@ function openDetail(id) {
       if (state.detailId === id && $('#detail').open && form === $('#contact-form')) await openChat(result.threadId);
       else toast('Contact envoyé. Retrouvez la conversation dans Mes échanges.');
     }
-    catch (error) { if (error.status === 409) void refreshPublicState(); detailError(id, error); }
+    catch (error) {rulesError(error,()=>{if(state.detailId===id&&$('#detail').open)form.querySelector('textarea').focus();},accountAtRequest); if (error.status === 409) void refreshPublicState(); detailError(id, error); }
     finally { form.dataset.submitting = 'false'; const latest = state.posts.find(p => p.id === id); if (state.detailId === id && $('#detail').open && latest) updateDetail(latest); }
   });
 }
@@ -350,7 +360,8 @@ $('#detail-content').addEventListener('click', async e => {
   if (e.target.closest('[data-owner-inbox]')) return openInbox();
   const share = e.target.closest('[data-share]'); if (share) { const link = `${location.origin}/?post=${encodeURIComponent(state.detailId)}`; try { await navigator.clipboard.writeText(link); toast(state.production?'Lien copié. Partagez-le avec vos contacts ou un groupe.':'Lien local copié. Testez-le dans une autre fenêtre de ce Mac.'); } catch { share.textContent = link; } return; }
   const button = e.target.closest('[data-mutate]'); if (!button || button.disabled) return;
-  const id = state.detailId, action = button.dataset.mutate, intent = `${id}:${action}`;
+  const id = state.detailId, action = button.dataset.mutate, intent = `${id}:${action}`,accountAtRequest=accountGeneration;
+  if(action==='reopen'&&!requireUGC(()=>{if(state.detailId===id&&$('#detail').open)button.focus();}))return;
   if (mutationsInFlight.has(id)) return;
   if (!mutationKeys.has(intent)) mutationKeys.set(intent, crypto.randomUUID());
   mutationsInFlight.add(id); button.disabled = true; $('#detail-error').hidden = true;
@@ -366,6 +377,7 @@ $('#detail-content').addEventListener('click', async e => {
     const latest = state.posts.find(p => p.id === id) || result.post;
     toast(latest.status === 'full' ? 'Annonce clôturée. Elle quitte le fil public.' : action === 'reopen' ? 'Annonce rouverte. L’heure d’expiration reste la même.' : `${latest.places} place${latest.places > 1 ? 's' : ''} restante${latest.places > 1 ? 's' : ''}.`);
   } catch (error) {
+    rulesError(error,()=>{if(state.detailId===id&&$('#detail').open)button.focus();},accountAtRequest);
     if (error.status === 409) mutationKeys.delete(intent);
     if (error.status === 409) void refreshPublicState();
     detailError(id, error);
@@ -562,14 +574,15 @@ function renderChatMessages(thread,id) {
   // Stable nodes keep their playback position when a new text reply arrives.
   if(changed&&beforeBottom)$('#chat-form').scrollIntoView({block:'end'});
 }
-$('#voice-record').addEventListener('click',()=>{if(state.voiceEnabled&&state.chat&&threads[state.chat]&&!threads[state.chat].blocked&&!state.chatPrivacyPending)void voice.start();});
+$('#voice-record').addEventListener('click',()=>{if(state.voiceEnabled&&state.chat&&threads[state.chat]&&!threads[state.chat].blocked&&!state.chatPrivacyPending&&requireUGC(()=>$('#voice-record').focus()))void voice.start();});
 $('#voice-stop').addEventListener('click',()=>voice.stop());
 $('#voice-discard').addEventListener('click',()=>voice.discard());
 $('#voice-send').addEventListener('click',async()=>{
   const id=state.chat,generation=accountGeneration;if(!id||!threads[id]||threads[id].blocked||state.chatPrivacyPending||!state.voiceEnabled)return;
+  if(!requireUGC(()=>{if(state.chat===id&&$('#chat').open)$('#voice-send').focus();}))return;
   const intent=voice.beginSend();if(!intent)return;
   try {await uploadVoice(id,intent);if(voice.finishSend(intent)&&state.chat===id&&generation===accountGeneration){toast('Vocal envoyé.');void refreshChat();}}
-  catch(error){voice.finishSend(intent,error);}
+  catch(error){voice.finishSend(intent,error);if(generation===accountGeneration)rulesError(error,()=>{if(state.chat===id&&$('#chat').open)$('#voice-send').focus();});}
 });
 document.addEventListener('play',event=>{if(event.target.tagName==='AUDIO')$$('audio').forEach(audio=>{if(audio!==event.target)audio.pause?.();});},true);
 document.addEventListener('visibilitychange',()=>{if(document.hidden){stopAudio(document);if(['requesting','recording','finishing'].includes(voice.phase))voice.fail('recording_interrupted');}});
@@ -625,8 +638,9 @@ async function openChat(id) {
 }
 $('#chat-input').addEventListener('input', () => { if (state.chat) outbox.edit(state.chat, $('#chat-input').value); });
 $('#chat-form').addEventListener('submit', async e => {
-  e.preventDefault(); const id = state.chat, token = threads[id]?.token;
+  e.preventDefault(); const id = state.chat, token = threads[id]?.token,accountAtRequest=accountGeneration;
   if (!id || (!state.production&&!token) || threads[id]?.blocked || state.chatPrivacyPending) return;
+  if(!requireUGC(()=>{if(state.chat===id&&$('#chat').open)$('#chat-input').focus();}))return;
   outbox.edit(id, $('#chat-input').value);
   const intent = outbox.begin(id); if (!intent) return;
   $('#chat-form button').disabled = true; $('#chat-error').hidden = true;
@@ -639,6 +653,7 @@ $('#chat-form').addEventListener('submit', async e => {
     }
   } catch (error) {
     outbox.finish(id, intent, error);
+    rulesError(error,()=>{if(state.chat===id&&$('#chat').open)$('#chat-input').focus();},accountAtRequest);
     if (state.chat === id && $('#chat').open) { $('#chat-error').textContent = errorText(error); $('#chat-error').hidden = false; }
   } finally {
     if (state.chat === id && $('#chat').open) $('#chat-form button').disabled = !threads[id] || threads[id]?.blocked || state.chatPrivacyPending || outbox.get(id).busy;

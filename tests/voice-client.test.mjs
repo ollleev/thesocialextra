@@ -114,7 +114,7 @@ function chatFixture(options={}) {
     accountGeneration:1,privateRevision:1,updatesRequest:null,updatesError:false,updatesCheckedAt:0,chatRequest:0,chatReads:new Map(),chatTimer:1,
     clearInterval(){},api:async()=>({threads:[]}),outbox:{retain(){},get:()=>({error:null,busy:false})},now:()=>1000,
     saveSession(){},renderUpdates(){},renderInbox(){},render(){},setConnection(){},errorText:error=>error.code,
-    renderChatMessages(){messageRenders++;},mergeSummary,freshPost,markRead,lastSnapshot:null,owners:{},mutationKeys:new Map(),
+    renderChatMessages(){messageRenders++;},mergeSummary,freshPost,markRead,lastSnapshot:null,owners:{},mutationKeys:new Map(),requireUGC:()=>true,
   });
   vm.runInContext([
     appFunction('function applyFeedRevision(','function receive('),
