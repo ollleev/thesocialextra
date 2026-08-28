@@ -71,6 +71,49 @@ test('JSON requests carry private authorization and intent only in headers, pres
 });
 
 const appSource=readFileSync(new URL('../public/app.js',import.meta.url),'utf8');
+
+function feedFixture() {
+  const calls=[],streams=[],received=[];let renders=0;
+  class Events {constructor(url){this.url=url;this.listeners={};streams.push(this);}addEventListener(name,fn){this.listeners[name]=fn;}close(){this.closed=true;}}
+  const context=vm.createContext({URLSearchParams,EventSource:Events,document:{hidden:false},feedGeneration:0,lastSnapshot:null,events:null,liveReady:true,
+    state:{production:true,city:{id:'2988507'},mine:false,kind:'need',role:'Plongeur',zone:'oberkampf',english:true,vehicle:true,sort:'oldest',point:{lat:48.85,lng:2.35}},
+    api(url){return new Promise((resolve,reject)=>calls.push({url,resolve,reject}));},receive(value){received.push(value);context.lastSnapshot=value;context.state.feedPending=false;context.state.feedError=false;},
+    setConnection(){},render(){renders++;},accounts:{refresh:async()=>{}},
+  });
+  vm.runInContext(appSource.slice(appSource.indexOf('function feedQuery('),appSource.indexOf('function openDetail(')),context);
+  return {context,calls,streams,received,renders:()=>renders};
+}
+
+test('changing job filters scopes both reads and streams and discards previous-search replies',async()=>{
+  const f=feedFixture(),first=f.context.changeFeed();
+  const params=new URL(f.calls[0].url,'https://extras.test').searchParams;
+  for(const [key,value] of Object.entries({kind:'need',role:'Plongeur',zone:'oberkampf',english:'true',vehicle:'true',sort:'oldest',lat:'48.85',lng:'2.35'}))assert.equal(params.get(key),value);
+  assert.equal(f.streams[0].url.replace('/api/events','/api/state'),f.calls[0].url);
+  f.context.state.role='Barman';const second=f.context.changeFeed();assert.equal(f.streams[0].closed,true);
+  f.streams[0].listeners.state({data:JSON.stringify({id:'old stream'})});f.calls[0].resolve({id:'old request'});await first;
+  assert.deepEqual(f.received,[]);assert.equal(f.context.state.feedPending,true);
+  f.calls[1].resolve({id:'new search'});await second;assert.deepEqual(f.received,[{id:'new search'}]);
+  assert.equal(f.context.state.feedPending,false);
+});
+
+test('a failed search has a retry state but an older failed read cannot erase a newer live result',async()=>{
+  const f=feedFixture(),failed=f.context.changeFeed();f.calls[0].reject(new Error('offline'));await failed;
+  assert.equal(f.context.state.feedPending,false);assert.equal(f.context.state.feedError,true);
+  const retried=f.context.changeFeed();assert.equal(f.context.state.feedError,false);
+  f.streams[1].listeners.state({data:JSON.stringify({id:'live result'})});f.calls[1].reject(new Error('old read failed'));await retried;
+  assert.equal(f.context.state.feedError,false);assert.equal(f.received[0].id,'live result');
+});
+
+test('public results do not append off-page owned posts and hide previous results while a new search loads',()=>{
+  const post=id=>({id,expiresAt:100,status:'open',kind:'need',role:'Barman',createdAt:1});
+  const context=vm.createContext({state:{posts:[post('shown'),post('off-page-own')],feedIds:new Set(['shown']),mine:false,kind:'all',zone:'all',role:'all'},owners:{'off-page-own':true},inCity:()=>true,now:()=>0});
+  const start=appSource.indexOf('function visiblePosts(');
+  vm.runInContext(appSource.slice(start,appSource.indexOf('const map =',start)),context);
+  assert.deepEqual(Array.from(context.visiblePosts(),p=>p.id),['shown']);
+  context.state.feedPending=true;assert.equal(context.visiblePosts().length,0);
+  context.state.feedPending=false;context.state.feedError=true;assert.equal(context.visiblePosts().length,0);
+});
+
 const accountStartup=appSource.slice(appSource.indexOf('function openAccountLink()'),appSource.lastIndexOf('\nstart();'));
 function accountStartupFixture(query,{sessionFails=false,feedFails=false}={}) {
   const calls=[],nodes=new Map();let parsedURL;
@@ -136,4 +179,56 @@ test('a detail read started before a block cannot restore its content afterwards
   f.context.state.detailId='other';f.$('#detail').open=true;
   resolve({post:{id:'other'},feedRevision:0});await read;
   assert.equal(f.detailUpdates(),0);assert.equal(f.context.state.detailPost,null);
+});
+
+test('publishing resets the server search and stream as well as visible filters',async()=>{
+const nodes = new Map(), $ = id => {
+  if (!nodes.has(id)) nodes.set(id, { disabled: false, open: id === '#composer', addEventListener(name, fn) { this[name] = fn; }, close() { this.open = false; }, focus() {} });
+  return nodes.get(id);
+};
+const old = { id: 'old-visible', kind: 'need', role: 'Plongeur', zoneId: 'oberkampf', english: true, vehicle: true, createdAt: 1, expiresAt: 999, status: 'open' };
+const post = { ...old, id: 'new-published', role: 'Barman', createdAt: 2 }, calls = [], streams = [];
+class Events { constructor(url) { this.url = url; streams.push(this); } addEventListener() {} close() { this.closed = true; } }
+class Data { get(key) { return ({ role: 'Barman', durationMinutes: '30', note: 'synthetic', zoneId: 'oberkampf', places: '1' })[key]; } has() { return false; } }
+const context = vm.createContext({ $, state: { production: true, posts: [old], feedIds: new Set([old.id]), mine: false, kind: 'need', role: 'Plongeur', zone: 'oberkampf', english: true, vehicle: true, sort: 'oldest', formKind: 'need', city: { id: '2988507' } },
+  owners: {}, now: () => 0, inCity: () => true, FormData: Data, accountGeneration: 1, composerGeneration: 1, publishing: false, requireUGC: () => true,
+  writeKey: () => 'synthetic-key', writeIntents: new Map(), saveSession() {}, freshPost: (a, b) => b, syncFilters() {}, map: { recenter() {} }, render() {}, toast() {}, openDetail() {}, rulesError() {}, errorText: e => String(e),
+  api: async url => { calls.push(url); return url === '/api/posts' ? { post } : { posts: [old, post] }; }, URLSearchParams, EventSource: Events, document: { hidden: false }, feedGeneration: 1, lastSnapshot: {}, events: null, liveReady: true,
+  setConnection() {}, receive(data) { context.state.feedPending = false; context.state.posts = data.posts; context.state.feedIds = new Set(data.posts.map(p => p.id)); }, accounts: { refresh: async () => {} },
+});
+let start = appSource.indexOf('function visiblePosts(');
+vm.runInContext(appSource.slice(start, appSource.indexOf('const map =', start)), context);
+vm.runInContext(appSource.slice(appSource.indexOf('function feedQuery('), appSource.indexOf('function openDetail(')), context);
+start = appSource.indexOf('function filtersChanged(');
+vm.runInContext(appSource.slice(start, appSource.indexOf('\n', start)), context);
+context.syncLiveConnection();
+vm.runInContext(appSource.slice(appSource.indexOf("$('#post-form').addEventListener('submit'"), appSource.indexOf('function syncFilters(')), context);
+await $('#post-form').submit({ preventDefault() {}, currentTarget: {} });
+await Promise.resolve();
+assert.equal(context.state.role, 'all');
+assert.equal(context.state.sort, 'recent');
+assert.equal(streams[0].closed, true);
+assert.equal(streams.at(-1).url, '/api/events?cityId=2988507&mine=false');
+assert.ok(calls.includes('/api/state?cityId=2988507&mine=false'));
+assert.ok(Array.from(context.visiblePosts(), p => p.id).includes(post.id));
+});
+
+test('a valid off-page detail can contact and retry, but removed or switched details cannot send',async()=>{
+  const id='off-page',post={id,role:'Barman',zoneLabel:'Zone synthétique',expiresAt:100,status:'open'};
+  const button={disabled:false},textarea={value:'Contact synthétique.'},dialog={open:true},calls=[],errors=[],opened=[];
+  const form={dataset:{},querySelector:selector=>selector==='textarea'?textarea:button,addEventListener(_event,handler){this.submit=handler;}};
+  const context=vm.createContext({id,post,state:{production:true,posts:[],detailId:id,detailPost:post,detailUnavailable:false},
+    $:selector=>selector==='#contact-form'?form:selector==='#detail'?dialog:{hidden:false},now:()=>0,requireUGC:()=>true,
+    accountGeneration:1,privateRevision:0,writeIntents:new Map(),writeKey:()=> 'synthetic-stable-contact',threads:{},saveSession(){},
+    async api(url,options){calls.push({url,options});if(calls.length===1)throw new Error('synthetic network failure');return {threadId:'thread'};},
+    updateDetail(value){button.disabled=value.status!=='open'||context.state.detailUnavailable||form.dataset.submitting==='true';},render(){},
+    rulesError(){},detailError(_id,error){errors.push(error);},openChat:async thread=>opened.push(thread),toast(){},outbox:{edit(){}},
+  });
+  const start=appSource.indexOf("  const form = $('#contact-form'); if (form) form.addEventListener",appSource.indexOf('function openDetail('));
+  vm.runInContext(appSource.slice(start,appSource.indexOf("\n}\n$('#detail-content')",start)),context);
+  const event={preventDefault(){}};await form.submit(event);
+  assert.equal(calls[0].url,'/api/posts/off-page/contact');assert.equal(errors.length,1);assert.equal(button.disabled,false);
+  await form.submit(event);assert.equal(calls.length,2);assert.deepEqual(opened,['thread']);
+  context.state.detailUnavailable=true;await form.submit(event);assert.equal(calls.length,2);assert.equal(button.disabled,true);
+  button.disabled=false;context.state.detailUnavailable=false;context.state.detailId='another';await form.submit(event);assert.equal(calls.length,2);
 });

@@ -156,6 +156,28 @@ test('outgoing author filtering happens before the feed limit and truncated coun
   assert.ok(filtered.posts.every(post=>store.getPublicPost(post.id,'reader').post.id===post.id));
 });
 
+test('job filters and oldest order run before the feed cap, with private counts and no stale closed posts',t=>{
+  const f=fixture(t),{store}=f;let oldest;
+  store.transaction(()=>{
+    oldest=store.create('target',input({role:'Plongeur',english:true,vehicle:true}),key('filter-target')).post;
+    f.advance(1);
+    for(let i=0;i<205;i++)store.create(`other-${Math.floor(i/10)}`,input(),key(`filter-other-${i}`));
+  });
+  assert.equal(store.state().posts.length,200);
+  const filtered=store.state({kind:'need',role:'Plongeur',zone:'oberkampf',english:true,vehicle:true,sort:'oldest'});
+  assert.deepEqual(filtered.posts.map(p=>p.id),[oldest.id]);assert.equal(filtered.total,1);assert.equal(filtered.truncated,false);
+  assert.deepEqual(filtered.counts,{all:206,available:0,need:206});
+  const ordered=store.state({kind:'need',sort:'oldest'});
+  assert.equal(ordered.posts[0].id,oldest.id);assert.equal(ordered.total,206);assert.equal(ordered.truncated,true);
+  assert.notEqual(filtered.scope,ordered.scope);
+  store.blockPost('reader',oldest.id);
+  const blocked=store.state({role:'Plongeur'},'reader');assert.equal(blocked.total,0);assert.equal(blocked.counts.all,205);
+  store.mutate('target',oldest.id,{action:'close'},key('filter-close'));
+  assert.equal(store.state({role:'Plongeur'}).total,0);
+  assert.equal(store.state({mine:true,role:'Plongeur'},'target').total,1);
+  for(const scope of [{kind:'other'},{role:'unknown'},{zone:'unknown'},{english:'false'},{vehicle:1},{sort:'unknown'}])assert.throws(()=>store.state(scope),error(400,'invalid_scope'));
+});
+
 test('block handles outlive source expiry, deletion and moderation and still govern future posts',t=>{
   for(const removal of ['expiry','delete','moderation']) {
     const f=fixture(t),{store}=f,post=store.create('author',input(),key('durable-block-post')).post;

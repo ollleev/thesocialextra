@@ -70,7 +70,7 @@ function cookieToken(req, name) {
   return token;
 }
 function scopeFrom(params) {
-  const allowed=new Set(['cityId','lat','lng','mine']);
+  const allowed=new Set(['cityId','lat','lng','mine','kind','role','zone','english','vehicle','sort']);
   for(const key of params.keys()) if(!allowed.has(key) || params.getAll(key).length!==1) fail(400,'invalid_scope');
   const cityId=params.get('cityId')??'2988507', mine=params.get('mine')??'false';
   if(!['true','false','1','0'].includes(mine)) fail(400,'invalid_scope');
@@ -79,7 +79,9 @@ function scopeFrom(params) {
     if(!params.get('lat')?.trim() || !params.get('lng')?.trim()) fail(400,'invalid_coordinates');
     point={lat:Number(params.get('lat')),lng:Number(params.get('lng'))};
   }
-  return {cityId,point,mine:mine==='true'||mine==='1'};
+  const bool=name=>{const value=params.get(name)??'false';if(!['true','false','1','0'].includes(value))fail(400,'invalid_scope');return value==='true'||value==='1';};
+  return {cityId,point,mine:mine==='true'||mine==='1',kind:params.get('kind')??'all',role:params.get('role')??'all',zone:params.get('zone')??'all',
+    english:bool('english'),vehicle:bool('vehicle'),sort:params.get('sort')??'recent'};
 }
 
 /** HTTPS terminates at the configured reverse proxy; never expose this listener directly. */

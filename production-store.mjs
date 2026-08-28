@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { ApiError, validatePost, publicPost, fields, text, incomingMessages, validateIdempotencyKey } from './domain.mjs';
+import { ApiError, ROLES, ZONES, validatePost, publicPost, fields, text, incomingMessages, validateIdempotencyKey } from './domain.mjs';
 import { pointForLocation, distanceKm } from './locations.mjs';
 
 export const PRIVATE_RETENTION_MS = 7 * 24 * 60 * 60_000;
@@ -182,7 +182,10 @@ export class ProductionStore {
   }
   postRow(id) { const row = this.db.prepare('SELECT * FROM app_posts WHERE id=? AND retain_until>?').get(id,this.clock()); if (!row) fail(404,'post_not_found'); return row; }
   livePost(id) { const row = this.postRow(id); if (row.expires_at <= this.clock()) fail(410,'post_expired'); return row; }
-  state({ cityId='2988507', point, mine=false }={}, userId=null) {
+  state({ cityId='2988507', point, mine=false, kind='all', role='all', zone='all', english=false, vehicle=false, sort='recent' }={}, userId=null) {
+    if(!['all','available','need'].includes(kind) || (role!=='all'&&!ROLES.includes(role)) ||
+      (zone!=='all'&&!ZONES.some(item=>item.id===zone)) || typeof english!=='boolean' || typeof vehicle!=='boolean' ||
+      !['recent','oldest'].includes(sort)) fail(400,'invalid_scope');
     this.sweep();
     const { point: origin } = pointForLocation(cityId,point);
     if (mine) this.actor(userId);
@@ -190,10 +193,17 @@ export class ProductionStore {
       : this.db.prepare(`SELECT data FROM app_posts p WHERE expired=0 AND lat BETWEEN ? AND ? AND expires_at>?
           AND NOT EXISTS(SELECT 1 FROM app_blocks b WHERE b.blocker_id=? AND b.blocked_id=p.owner_id)
           ORDER BY expires_at DESC`).all(origin.lat-0.23,origin.lat+0.23,this.clock(),userId);
-    const candidates = rows.map(parse).filter(post => mine || (post.status==='open' && distanceKm(origin,post)<=25)).sort((a,b)=>b.createdAt-a.createdAt);
+    const local = rows.map(parse).filter(post => mine || (post.status==='open' && distanceKm(origin,post)<=25));
+    const active=local.filter(post=>post.status==='open');
+    const counts={all:active.length,available:active.filter(post=>post.kind==='available').length,need:active.filter(post=>post.kind==='need').length};
+    // Apply the user's search before capping the payload. Otherwise a rare job
+    // can disappear behind 200 more recent posts of unrelated professions.
+    const candidates=local.filter(post=>(kind==='all'||post.kind===kind)&&(role==='all'||post.role===role)&&
+      (zone==='all'||post.zoneId===zone)&&(!english||post.english)&&(!vehicle||post.vehicle))
+      .sort((a,b)=>(sort==='oldest'?a.createdAt-b.createdAt:b.createdAt-a.createdAt)||a.id.localeCompare(b.id));
     const meta=this.db.prepare('SELECT epoch,version FROM app_meta WHERE id=1').get();
     return { posts:candidates.slice(0,200).map(publicPost), now:this.clock(), mode:'production', ...meta,
-      scope:JSON.stringify({cityId,point:point??null,mine}), truncated:candidates.length>200,
+      scope:JSON.stringify({cityId,point:point??null,mine,kind,role,zone,english,vehicle,sort}), total:candidates.length, counts, truncated:candidates.length>200,
       ...(userId?{feedRevision:this.feedRevision(userId),ownedPostIds:this.ownership(userId),ownedPosts:this.db.prepare('SELECT data FROM app_posts WHERE owner_id=? AND expires_at>? ORDER BY expires_at DESC LIMIT 10').all(userId,this.clock()).map(parse).map(publicPost)}:{}) };
   }
   getPublicPost(id, userId=null) {

@@ -104,18 +104,24 @@ function statusLabel(post) { if (post.status === 'full') return post.kind === 'n
 function title(post) { return post.kind === 'need' ? `${post.places || post.totalPlaces} ${post.role.toLowerCase()}${(post.places || post.totalPlaces) > 1 ? 's' : ''} recherché${(post.places || post.totalPlaces) > 1 ? 's' : ''}` : post.role; }
 function tags(post) { return `${post.english ? `<span>${icon('languages')}Anglais</span>` : ''}${post.vehicle ? `<span>${icon('car')}Véhiculé</span>` : ''}${post.kind === 'need' && post.status === 'open' ? `<span class="places-label">${post.places} place${post.places > 1 ? 's' : ''}</span>` : ''}${post.pay ? `<span class="pay-label">${esc(post.pay)} €/h</span>` : ''}`; }
 function inCity(post) { if (state.mine) return true; const origin = state.point || state.city, rad = Math.PI / 180; const a = Math.sin((post.lat-origin.lat)*rad/2)**2 + Math.cos(origin.lat*rad)*Math.cos(post.lat*rad)*Math.sin((post.lng-origin.lng)*rad/2)**2; return 6371*2*Math.atan2(Math.sqrt(Math.min(1,a)), Math.sqrt(Math.max(0,1-a))) <= 25; }
-function visiblePosts() { return state.posts.filter(post => inCity(post) && post.expiresAt > now() && (state.mine || post.status === 'open') && (!state.mine || owners[post.id]) && (state.kind === 'all' || post.kind === state.kind) && (state.zone === 'all' || post.zoneId === state.zone) && (state.role === 'all' || post.role === state.role) && (!state.english || post.english) && (!state.vehicle || post.vehicle)).sort((a, b) => state.kind === 'need' && state.sort === 'oldest' ? a.createdAt - b.createdAt : b.createdAt - a.createdAt); }
+function visiblePosts() { if(state.feedPending||state.feedError)return [];return state.posts.filter(post => (state.mine||!state.feedIds||state.feedIds.has(post.id)) && inCity(post) && post.expiresAt > now() && (state.mine || post.status === 'open') && (!state.mine || owners[post.id]) && (state.kind === 'all' || post.kind === state.kind) && (state.zone === 'all' || post.zoneId === state.zone) && (state.role === 'all' || post.role === state.role) && (!state.english || post.english) && (!state.vehicle || post.vehicle)).sort((a, b) => state.kind === 'need' && state.sort === 'oldest' ? a.createdAt - b.createdAt : b.createdAt - a.createdAt); }
 const map = new LocalMap($('#map'), { pinHTML: post => `<span class="status-dot"></span>${esc(post.role)}${post.kind === 'need' ? `<small>${post.places}</small>` : ''}`, onSelect: id => selectPost(id), onOverflow: () => { setView('feed'); $('#feed-title').scrollIntoView({block:'center'}); } });
 function render() {
   const active = state.posts.filter(p => inCity(p) && p.expiresAt > now() && p.status === 'open' && (!state.mine || owners[p.id]));
-  $('#all-count').textContent = active.length; $('#available-count').textContent = active.filter(p => p.kind === 'available').length; $('#need-count').textContent = active.filter(p => p.kind === 'need').length;
+  const counts=state.production&&state.feedCounts?state.feedCounts:{all:active.length,available:active.filter(p=>p.kind==='available').length,need:active.filter(p=>p.kind==='need').length};
+  for(const kind of ['all','available','need'])$('#'+kind+'-count').textContent=state.feedPending||state.feedError?'—':counts[kind];
   const owned = state.posts.filter(p => owners[p.id] && p.expiresAt > now()); $('#mine-count').hidden = !owned.length; $('#mine-count').textContent = owned.length;
   $('#full-legend').hidden = !state.mine;
   $('#feed-expiry').textContent = state.mine ? 'Vos annonces clôturées restent ici jusqu’à expiration.' : 'Les annonces expirent. Le fil reste frais.';
   const visible = visiblePosts();
   $('#feed-title').textContent = state.mine ? 'Mes annonces' : state.zone === 'all' ? state.city.name : state.zones.find(z => z.id === state.zone)?.label || 'Dans le coin';
   $('#result-count').textContent = `${visible.length} annonce${visible.length !== 1 ? 's' : ''} ${state.mine ? (state.production?'sur votre compte':'dans cette session') : 'en ce moment'}`;
-  if (!visible.length) {
+  $('#feed-limit').hidden=!state.feedTruncated||state.feedPending||state.feedError;
+  $('#feed-limit').textContent=state.feedTruncated?`Les 200 annonces ${state.sort==='oldest'?'les plus anciennes':'les plus récentes'} parmi ${state.feedTotal} correspondances. Précisez le métier ou le quartier pour affiner.`:'';
+  if(state.feedPending||state.feedError) {
+    $('#result-count').textContent=state.feedPending?'Actualisation du fil…':'Le fil est indisponible.';
+    $('#post-list').innerHTML=state.feedPending?'<p class="loading-copy">Recherche des annonces…</p>':'<div class="empty-state"><h3>Le fil n’a pas pu être chargé.</h3><p>Vos filtres sont conservés. Réessayez lorsque la connexion revient.</p><button class="button outline" data-retry-feed>Réessayer</button></div>';
+  } else if (!visible.length) {
     $('#post-list').innerHTML = `<div class="empty-state">${icon(state.mine ? 'radio' : 'map-pin')}<h3>${state.mine ? 'À vous d’apparaître.' : 'Le coin est calme.'}</h3><p>${state.mine ? 'Une dispo ou un besoin ? Quelques cases suffisent.' : 'Aucune annonce ne correspond à ces filtres. Élargissez la recherche ou lancez la première.'}</p><button class="button lime" data-empty-action>${state.mine ? 'Je suis dispo' : 'Publier une annonce'}${icon('plus')}</button></div>`;
   } else {
     $('#post-list').innerHTML = visible.map(post => `<button class="post-row ${post.kind} ${state.selected === post.id ? 'selected' : ''}" data-post="${esc(post.id)}" aria-label="${esc(title(post))}, ${esc(post.zoneLabel)}, ${esc(statusLabel(post))}${post.demo ? ', exemple' : ''}"><div class="row-top"><span class="state-label ${post.kind === 'need' ? 'need' : ''} ${post.status === 'full' ? 'full' : ''}"><span class="status-dot"></span>${statusLabel(post)}</span><span class="row-age">${relative(post.updatedAt)}</span></div><div class="row-main"><span class="role-symbol">${icon(roleIcon(post.role))}</span><div class="row-text"><h3>${esc(title(post))}</h3><p>${icon('map-pin')}${esc(post.zoneLabel)} <span aria-hidden="true">·</span> ${post.status === 'full' ? 'Clôturé' : `Encore ${remaining(post)}`}</p></div>${icon('arrow-up-right', 'class="row-arrow"')}</div><div class="row-tags">${tags(post)}<span class="demo-label">${post.demo ? 'Exemple' : owners[post.id] ? 'Votre annonce' : state.production ? 'Annonce locale' : 'Essai local'}</span></div></button>`).join('');
@@ -143,7 +149,7 @@ function applyFeedRevision(data) {
   const revision=Number.isSafeInteger(data.feedRevision)?data.feedRevision:0;
   if(revision<(state.feedRevision||0))return false;
   if(revision>(state.feedRevision||0)) {
-    state.feedRevision=revision;++privateRevision;++chatRequest;state.chatPrivacyPending=Boolean(state.chat);
+    state.feedRevision=revision;state.feedCounts=null;state.feedTruncated=false;state.feedTotal=null;++privateRevision;++chatRequest;state.chatPrivacyPending=Boolean(state.chat);
     if(['requesting','recording','finishing'].includes(voice.phase))voice.discard();else renderVoice();
     state.posts=state.posts.filter(post=>owners[post.id]);state.selected=null;
     if(state.detailId&&!owners[state.detailId]) {state.detailId=null;state.detailPost=null;$('#detail').close();$('#detail-content').replaceChildren();}
@@ -160,6 +166,8 @@ function receive(data) {
   }
   if(state.production && lastSnapshot?.epoch===data.epoch && lastSnapshot?.scope===data.scope && lastSnapshot.version>data.version) return;
   lastSnapshot={epoch:data.epoch,scope:data.scope,version:data.version};
+  state.feedPending=false;state.feedError=false;state.feedIds=state.production?new Set(data.posts.map(post=>post.id)):null;
+  state.feedCounts=data.counts||null;state.feedTotal=data.total??null;state.feedTruncated=data.truncated===true;
   if(state.production && !state.mine) {
     for(const id of Object.keys(owners))delete owners[id];for(const id of data.ownedPostIds||[])owners[id]=true;
     const incoming=new Set(data.posts.map(p=>p.id));
@@ -213,7 +221,7 @@ $('#post-form').addEventListener('submit', async event => {
     if (index < 0) state.posts.push(result.post);
     else state.posts[index] = freshPost(state.posts[index], result.post);
     if (generation !== composerGeneration || !$('#composer').open) { render(); toast('Votre annonce a été publiée. Retrouvez-la dans Mes annonces.'); return; }
-    state.kind = 'all'; state.zone = 'all'; state.role = 'all'; state.english = false; state.vehicle = false; syncFilters();
+    state.kind = 'all'; state.zone = 'all'; state.role = 'all'; state.sort = 'recent'; state.english = false; state.vehicle = false; filtersChanged();
     state.selected = result.post.id; map.recenter(result.post); render(); $('#composer').close();
     toast(state.production?'Votre annonce est en direct.':'Votre annonce est en direct dans cet essai local.'); openDetail(result.post.id);
   } catch (error) {
@@ -227,19 +235,20 @@ function syncFilters() {
   $('#zone-filter').value = state.zone; $('#role-filter').value = state.role; $('#english-filter').checked = state.english; $('#vehicle-filter').checked = state.vehicle; $('#sort-filter').value = state.sort; $('#sort-control').hidden = state.kind !== 'need';
   $$('[data-kind]').forEach(button => { button.classList.toggle('active', button.dataset.kind === state.kind); button.setAttribute('aria-pressed', String(button.dataset.kind === state.kind)); });
 }
-$$('[data-kind]').forEach(button => button.addEventListener('click', () => { state.kind = button.dataset.kind; if (state.kind !== 'need') state.sort = 'recent'; syncFilters(); render(); }));
-$('#zone-filter').addEventListener('change', event => { state.zone = event.target.value; map.recenter(state.zones.find(z => z.id === state.zone) || state.city); $('#map-area').textContent = state.zone === 'all' ? `${state.city.name} · rayon 25 km` : state.zones.find(z => z.id === state.zone).label; render(); });
-$('#role-filter').addEventListener('change', e => { state.role = e.target.value; render(); });
-$('#sort-filter').addEventListener('change', e => { state.sort = e.target.value; render(); });
-for (const [selector, key] of [['#english-filter', 'english'], ['#vehicle-filter', 'vehicle']]) $(selector).addEventListener('change', e => { state[key] = e.target.checked; render(); });
+function filtersChanged() {syncFilters();if(state.production&&liveReady)void changeFeed();else render();}
+$$('[data-kind]').forEach(button => button.addEventListener('click', () => { state.kind = button.dataset.kind; if (state.kind !== 'need') state.sort = 'recent'; filtersChanged(); }));
+$('#zone-filter').addEventListener('change', event => { state.zone = event.target.value; map.recenter(state.zones.find(z => z.id === state.zone) || state.city); $('#map-area').textContent = state.zone === 'all' ? `${state.city.name} · rayon 25 km` : state.zones.find(z => z.id === state.zone).label; filtersChanged(); });
+$('#role-filter').addEventListener('change', e => { state.role = e.target.value; filtersChanged(); });
+$('#sort-filter').addEventListener('change', e => { state.sort = e.target.value; filtersChanged(); });
+for (const [selector, key] of [['#english-filter', 'english'], ['#vehicle-filter', 'vehicle']]) $(selector).addEventListener('change', e => { state[key] = e.target.checked; filtersChanged(); });
 $('#more-filters').addEventListener('click', () => { const hidden = !$('#extra-filters').hidden; $('#extra-filters').hidden = hidden; $('#more-filters').setAttribute('aria-expanded', String(!hidden)); });
-$('#reset-filters').addEventListener('click', () => { Object.assign(state, { kind: 'all', zone: 'all', role: 'all', sort: 'recent', english: false, vehicle: false }); syncFilters(); map.recenter(state.city); render(); });
+$('#reset-filters').addEventListener('click', () => { Object.assign(state, { kind: 'all', zone: 'all', role: 'all', sort: 'recent', english: false, vehicle: false }); map.recenter(state.city); filtersChanged(); });
 function setMine(mine) { if(mine&&!accounts.require(()=>setMine(true))) return; state.mine = mine; $('#mine-nav').classList.toggle('active', mine); $('#live-nav').classList.toggle('active', !mine); (mine ? $('#mine-nav') : $('#live-nav')).setAttribute('aria-current', 'page'); (mine ? $('#live-nav') : $('#mine-nav')).removeAttribute('aria-current'); syncFilters(); if (mine) setView('feed'); if(state.production) void changeFeed();render(); }
 $('#mine-nav').addEventListener('click', () => setMine(true)); $('#live-nav').addEventListener('click', () => setMine(false));
 function setView(view) { $('.workspace').dataset.mobileView = view; $$('[data-view]').forEach(b => { b.classList.toggle('active', b.dataset.view === view); b.setAttribute('aria-pressed', String(b.dataset.view === view)); }); if (view === 'map') requestAnimationFrame(() => map.render()); }
 $$('[data-view]').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
 $('#zoom-in').addEventListener('click', () => map.changeZoom(1)); $('#zoom-out').addEventListener('click', () => map.changeZoom(-1)); $('#recenter').addEventListener('click', () => map.recenter(state.zones.find(z => z.id === state.zone) || state.point || state.city));
-$('#post-list').addEventListener('click', event => { const post = event.target.closest('[data-post]'); if (post) { state.selected = post.dataset.post; render(); openDetail(post.dataset.post); } if (event.target.closest('[data-empty-action]')) openComposer('available'); });
+$('#post-list').addEventListener('click', event => { if(event.target.closest('[data-retry-feed]')){void changeFeed();return;}const post = event.target.closest('[data-post]'); if (post) { state.selected = post.dataset.post; render(); openDetail(post.dataset.post); } if (event.target.closest('[data-empty-action]')) openComposer('available'); });
 $('#map-selection').addEventListener('click', e => { if (e.target.closest('[data-clear-selection]')) { state.selected = null; render(); } const button = e.target.closest('[data-detail]'); if (button) openDetail(button.dataset.detail); });
 $('#how-button').addEventListener('click', () => openDialog($('#help')));
 $('#share-feed').addEventListener('click', async () => {
@@ -305,8 +314,8 @@ function detailError(id, error) {
   if (state.detailId === id && $('#detail').open) { $('#detail-error').textContent = errorText(error); $('#detail-error').hidden = false; }
   else toast(errorText(error));
 }
-function feedQuery() { const q=new URLSearchParams({cityId:state.city.id,mine:String(state.mine)});if(state.point){q.set('lat',state.point.lat);q.set('lng',state.point.lng);}return state.production?`?${q}`:''; }
-function refreshPublicState() { const generation=feedGeneration; return api(`/api/state${feedQuery()}`).then(data=>{if(generation===feedGeneration)receive(data);}).catch(()=>{if(generation===feedGeneration)setConnection(false);}); }
+function feedQuery() { const q=new URLSearchParams({cityId:state.city.id,mine:String(state.mine)});for(const key of ['kind','role','zone'])if(state[key]&&state[key]!=='all')q.set(key,state[key]);for(const key of ['english','vehicle'])if(state[key])q.set(key,'true');if(state.sort==='oldest')q.set('sort','oldest');if(state.point){q.set('lat',state.point.lat);q.set('lng',state.point.lng);}return state.production?`?${q}`:''; }
+function refreshPublicState() { const generation=feedGeneration,snapshot=lastSnapshot; return api(`/api/state${feedQuery()}`).then(data=>{if(generation===feedGeneration)receive(data);}).catch(()=>{if(generation===feedGeneration&&lastSnapshot===snapshot){state.feedPending=false;state.feedError=true;setConnection(false);render();}}); }
 function syncLiveConnection() {
   if(document.hidden) { events?.close();events=null;return; }
   if(events||!liveReady) return;
@@ -316,7 +325,7 @@ function syncLiveConnection() {
   events.addEventListener('session-expired',()=>{events?.close();events=null;void accounts.refresh().catch(()=>setConnection(false));});
   events.onerror=()=>{if(generation===feedGeneration)setConnection(false);};
 }
-function changeFeed() { feedGeneration++;lastSnapshot=null;events?.close();events=null;syncLiveConnection();return refreshPublicState(); }
+function changeFeed() { feedGeneration++;lastSnapshot=null;state.feedPending=true;state.feedError=false;state.feedCounts=null;state.feedTotal=null;state.feedTruncated=false;state.selected=null;events?.close();events=null;setConnection(false);render();syncLiveConnection();return refreshPublicState(); }
 function openDetail(id) {
   const post = state.posts.find(p => p.id === id && p.expiresAt > now()); if (!post) { toast('Cette annonce a expiré.'); return; }
   state.detailId = id;state.detailPost=post;state.detailUnavailable=false; const own = Boolean(owners[id]);
@@ -325,9 +334,11 @@ function openDetail(id) {
   updateDetail(post); openDialog($('#detail'));
   const form = $('#contact-form'); if (form) form.addEventListener('submit', async e => {
     e.preventDefault(); const button = form.querySelector('button[type="submit"]'); if (button.disabled) return;
+    if(state.detailId!==id||!$('#detail').open||form!==$('#contact-form'))return;
     if(!requireUGC(()=>{if(state.detailId===id){if(!$('#detail').open)openDialog($('#detail'));form.querySelector('textarea').focus();}})) return;
-    const current = state.posts.find(p => p.id === id && p.expiresAt > now());
-    if (!current || current.status !== 'open') { if (current) updateDetail(current); else render(); return; }
+    const current = state.posts.find(p => p.id === id && p.expiresAt > now()) ||
+      (state.production&&state.detailPost?.id===id&&state.detailPost.expiresAt>now()?state.detailPost:null);
+    if (!current || current.status !== 'open'||state.detailUnavailable) { if (current) updateDetail(current); else render(); return; }
     button.disabled = true; form.dataset.submitting = 'true'; $('#detail-error').hidden = true;const accountAtRequest=accountGeneration;
     try {
       const payload={message:form.querySelector('textarea').value.trim()},generationAtWrite=accountGeneration;
@@ -341,7 +352,7 @@ function openDetail(id) {
       else toast('Contact envoyé. Retrouvez la conversation dans Mes échanges.');
     }
     catch (error) {rulesError(error,()=>{if(state.detailId===id&&$('#detail').open)form.querySelector('textarea').focus();},accountAtRequest); if (error.status === 409) void refreshPublicState(); detailError(id, error); }
-    finally { form.dataset.submitting = 'false'; const latest = state.posts.find(p => p.id === id); if (state.detailId === id && $('#detail').open && latest) updateDetail(latest); }
+    finally { form.dataset.submitting = 'false'; const latest = state.posts.find(p => p.id === id)||(state.detailPost?.id===id?state.detailPost:null); if (state.detailId === id && $('#detail').open && latest) updateDetail(latest); }
   });
 }
 $('#detail-content').addEventListener('click', async e => {
@@ -736,9 +747,9 @@ async function start() {
     // Resolve the destination before the first snapshot and before opening SSE.
     // A login/logout during startup also invalidates the pending private snapshot.
     while (true) {
-      const generation = accountGeneration;
-      const initial = await api(`/api/state${feedQuery()}`);
-      if (generation !== accountGeneration) continue;
+      const generation = accountGeneration,query=feedQuery();
+      const initial = await api(`/api/state${query}`);
+      if (generation !== accountGeneration||query!==feedQuery()) continue;
       receive(initial); break;
     }
     if (linkedPost && linkedGeneration===accountGeneration && linkedRevision===(state.feedRevision||0) && !state.posts.some(post => post.id === linkedPost.id)) state.posts.push(linkedPost);

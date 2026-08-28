@@ -47,3 +47,5 @@ Proposez des changements limités, accompagnés de tests du comportement modifi�
 ## Licence
 
 [MIT](LICENSE) pour le code original. Les ressources tierces gardent leurs licences respectives. Cette licence autorise aussi les forks commerciaux ; elle ne garantit pas leurs prix, leur hébergement ou leur fonctionnement.
+
+Les filtres de recherche (métier, type, quartier, anglais, véhicule) et le tri sont appliqués par le serveur avant le plafond de200annonces affichées. Si davantage correspondent, l’interface indique la limite et invite à préciser la recherche. Un lien direct vers une annonce active reste consultable et contactable même hors de cette sélection.

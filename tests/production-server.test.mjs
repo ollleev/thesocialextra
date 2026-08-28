@@ -136,6 +136,24 @@ test('recovery revokes old sessions and account deletion requires password and r
   assert.equal(f.db.prepare('SELECT COUNT(*) n FROM auth_users').get().n,1);
 });
 
+test('HTTP and live streams apply job filters and reject ambiguous search parameters',async t=>{
+  const f=await fixture(t),owner=await f.register('filtered_owner');
+  const barman=f.app.store.create(owner.data.user.id,input(),key()).post;
+  const query='?kind=need&role=Plongeur&english=true&vehicle=1&sort=oldest';
+  const stream=await f.stream('/api/events'+query);
+  const before=(await stream.next()).data;assert.deepEqual(before.posts,[]);assert.equal(before.counts.need,1);
+  f.app.store.create(owner.data.user.id,input({role:'Plongeur',english:true,vehicle:false}),key());
+  assert.deepEqual((await stream.next()).data.posts,[]);
+  const match=f.app.store.create(owner.data.user.id,input({role:'Plongeur',english:true,vehicle:true}),key()).post;
+  const live=(await stream.next()).data;assert.deepEqual(live.posts.map(p=>p.id),[match.id]);assert.equal(live.total,1);
+  const state=await f.request('/api/state'+query);assert.equal(state.status,200);assert.deepEqual(state.data,live);
+  assert.equal((await f.request('/api/state?sort=oldest')).data.posts[0].createdAt,barman.createdAt);
+  for(const bad of ['?role=unknown','?role=Barman&role=Plongeur','?english=yes','?vehicle=','?sort=unknown','?kind=other','?zone=unknown']) {
+    assert.equal((await f.request('/api/state'+bad)).status,400);
+    assert.equal((await f.request('/api/events'+bad)).status,400);
+  }
+});
+
 test('SSE is scoped, private changes remain private, and revoked/expired sessions close streams',async t=>{
   const f=await fixture(t),owner=await f.register('sse_owner'),guest=await f.register('sse_guest');
   const publicStream=await f.stream(),mine=await f.stream('/api/events?mine=true',owner.cookie),london=await f.stream('/api/events?cityId=2643743');
